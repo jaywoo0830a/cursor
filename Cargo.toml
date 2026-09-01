@@ -24,5 +24,10 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 env_logger = "0.11"
 
+# Windows: global cursor position (GetCursorPos) + system cursor visibility
+# (ShowCursor) for the click pass-through mode.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [profile.release]
 opt-level = 3

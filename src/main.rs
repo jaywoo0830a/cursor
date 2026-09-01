@@ -10,9 +10,15 @@
 //!
 //! Controls:
 //! * `F1`  – toggle the settings panel
-//! * `Esc` – quit (when not editing the region)
+//! * `Esc` – quit
 //! * While *Edit region* is on, drag the blue box to move it and the white
 //!   handles to resize it.
+//!
+//! On Windows, *Click pass-through* (default on) lets clicks go through the
+//! overlay to the apps below; the cursor position is then polled via
+//! `GetCursorPos` and the system cursor is hidden/shown with `ShowCursor`.
+//! While the settings panel or region editing is open, pass-through is
+//! automatically disabled so the panel stays interactive.
 //!
 //! The custom cursor image is either `assets/cursor.png` (straight RGBA PNG)
 //! or, if that file is missing, a classic arrow cursor generated in code.
@@ -56,6 +62,54 @@ const HANDLE_SIZE: f32 = 12.0;
 
 /// Minimum region size (points).
 const MIN_REGION: f32 = 24.0;
+
+// ---------------------------------------------------------------------------
+// Platform helpers
+// ---------------------------------------------------------------------------
+
+/// Global mouse position and system cursor visibility.
+///
+/// With click pass-through enabled the overlay window no longer receives
+/// pointer events, and winit's per-window cursor API is ignored (the OS shows
+/// the cursor of the window below the pointer). So on Windows we poll the
+/// global cursor position with `GetCursorPos` and hide/show the cursor with
+/// `ShowCursor`, which affects the whole desktop session.
+#[cfg(target_os = "windows")]
+mod platform {
+    /// Global mouse position in physical screen pixels (origin = top-left of
+    /// the primary monitor).
+    pub fn global_cursor_pos() -> Option<(f64, f64)> {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        unsafe {
+            let mut pt = std::mem::zeroed::<POINT>();
+            if GetCursorPos(&mut pt) != 0 {
+                Some((pt.x as f64, pt.y as f64))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Hide (`false`) / show (`true`) the system cursor. `ShowCursor` uses a
+    /// global display counter, so every `false` must be paired with a `true`.
+    pub fn set_system_cursor_visible(visible: bool) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor;
+        unsafe {
+            let _ = ShowCursor(visible as i32);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+mod platform {
+    pub fn global_cursor_pos() -> Option<(f64, f64)> {
+        None
+    }
+
+    pub fn set_system_cursor_visible(_visible: bool) {}
+}
 
 // ---------------------------------------------------------------------------
 // Cursor bitmap
@@ -190,10 +244,19 @@ struct CursorOverlayApp {
     /// Master switch for the custom-cursor behavior.
     enabled: bool,
     /// Use the native OS-level bitmap cursor (whole window) instead of the
-    /// region-limited painted cursor.
+    /// region-limited painted cursor. Only used without click pass-through.
     use_os_cursor: bool,
     /// Draw the faint blue region outline while the overlay is active.
     show_region_visual: bool,
+    /// Click pass-through (Windows only): clicks go to the apps below and the
+    /// cursor position is polled via `GetCursorPos`.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    passthrough: bool,
+    /// Whether we currently hid the OS cursor via `ShowCursor(FALSE)`.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    cursor_hidden: bool,
+    /// Last pass-through value sent to the viewport (to avoid re-sending).
+    last_passthrough: Option<bool>,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -228,10 +291,18 @@ impl CursorOverlayApp {
             os_cursor,
             region: default_region(),
             show_settings: true,
-            editing: true,
+            editing: false,
             enabled: true,
             use_os_cursor: false,
             show_region_visual: true,
+            // Click pass-through is only implemented on Windows (global
+            // cursor polling via GetCursorPos).
+            #[cfg(target_os = "windows")]
+            passthrough: true,
+            #[cfg(not(target_os = "windows"))]
+            passthrough: false,
+            cursor_hidden: false,
+            last_passthrough: None,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -321,6 +392,48 @@ impl CursorOverlayApp {
         }
     }
 
+    /// Current pointer position in window points.
+    ///
+    /// In click-through mode winit stops delivering pointer events, so we
+    /// poll the global cursor position instead (Windows only).
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+    fn pointer_pos(&self, ctx: &egui::Context, passthrough: bool) -> Option<egui::Pos2> {
+        #[cfg(target_os = "windows")]
+        {
+            if passthrough {
+                if let Some((x, y)) = platform::global_cursor_pos() {
+                    let ppp = ctx.pixels_per_point();
+                    let origin = ctx
+                        .input(|i| i.viewport().outer_rect.map(|r| r.min))
+                        .unwrap_or(egui::Pos2::ZERO);
+                    return Some(egui::pos2(x as f32 / ppp, y as f32 / ppp) - origin.to_vec2());
+                }
+            }
+        }
+        ctx.pointer_interact_pos()
+    }
+
+    /// Hide/show the OS cursor. With click-through enabled we must use the
+    /// global `ShowCursor` API (winit's per-window cursor is ignored for
+    /// transparent/pass-through windows). The calls are paired to keep
+    /// Windows' display counter balanced.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
+    fn set_system_cursor_visible(&mut self, passthrough: bool, visible: bool) {
+        if !passthrough {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if !visible && !self.cursor_hidden {
+                platform::set_system_cursor_visible(false);
+                self.cursor_hidden = true;
+            } else if visible && self.cursor_hidden {
+                platform::set_system_cursor_visible(true);
+                self.cursor_hidden = false;
+            }
+        }
+    }
+
     /// Draw the region rectangle (+ handles while editing).
     fn paint_region(&self, ui: &mut egui::Ui) {
         // In run mode the outline is optional (toggle in the settings).
@@ -333,12 +446,12 @@ impl CursorOverlayApp {
         painter.rect_filled(
             r,
             CornerRadius::ZERO,
-            Color32::from_rgba_premultiplied(0, 200, 255, 14),
+            Color32::from_rgba_premultiplied(0, 200, 255, 8),
         );
         painter.rect_stroke(
             r,
             CornerRadius::ZERO,
-            Stroke::new(1.5, Color32::from_rgba_premultiplied(0, 200, 255, 140)),
+            Stroke::new(1.5, Color32::from_rgba_premultiplied(0, 200, 255, 110)),
             StrokeKind::Inside,
         );
 
@@ -400,9 +513,16 @@ impl CursorOverlayApp {
                 )
                 .on_hover_text(
                     "Registers the bitmap as a real OS cursor via winit.\n\
-                     Applies to the whole window, not just the region.",
+                     Applies to the whole window, not just the region.\n\
+                     Disabled while click pass-through is active.",
                 );
                 ui.checkbox(&mut self.show_region_visual, "Show region outline");
+                #[cfg(target_os = "windows")]
+                ui.checkbox(&mut self.passthrough, "Click pass-through (mouse)")
+                    .on_hover_text(
+                        "Clicks pass through the overlay to the apps below.\n\
+                         Uses global cursor tracking (GetCursorPos).",
+                    );
                 ui.separator();
 
                 let r = self.region;
@@ -435,9 +555,14 @@ impl CursorOverlayApp {
                 });
                 ui.separator();
 
-                if ui.button("Quit (Esc)").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Close panel (F1)").clicked() {
+                        self.show_settings = false;
+                    }
+                    if ui.button("Quit (Esc)").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
             });
     }
 
@@ -464,12 +589,26 @@ impl eframe::App for CursorOverlayApp {
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.show_settings = !self.show_settings;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.editing {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // ---- pointer ----
-        let pointer = ctx.pointer_interact_pos();
+        // ---- click pass-through ----
+        // Enabled only while the window is not needed for interaction
+        // (settings panel and region editing closed) and only on Windows,
+        // where we can poll the global cursor position.
+        #[cfg(target_os = "windows")]
+        let passthrough = self.passthrough && !self.show_settings && !self.editing;
+        #[cfg(not(target_os = "windows"))]
+        let passthrough = false;
+
+        if self.last_passthrough != Some(passthrough) {
+            self.last_passthrough = Some(passthrough);
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
+        }
+
+        // ---- pointer position ----
+        let pointer = self.pointer_pos(&ctx, passthrough);
 
         // ---- region editing ----
         if self.editing {
@@ -480,26 +619,30 @@ impl eframe::App for CursorOverlayApp {
         self.paint_region(ui);
 
         // ---- custom cursor behavior ----
-        // Active only when the overlay is enabled, not editing, and the
-        // settings panel is closed (so the panel stays usable).
-        let active = self.enabled && !self.editing && !self.show_settings;
+        let active = self.enabled && !self.editing;
         let in_region = pointer.is_some_and(|p| self.region.contains(p));
 
-        if active && self.use_os_cursor {
+        if active && self.use_os_cursor && !passthrough {
             // Native OS-level bitmap cursor: not region-limited, but a real,
-            // un-clipped cursor provided by the OS/winit.
+            // un-clipped cursor provided by the OS/winit (no click-through).
             ctx.set_cursor_image(Some(self.os_cursor.clone()));
             ctx.set_cursor_icon(CursorIcon::Default);
+            self.set_system_cursor_visible(passthrough, true);
         } else if active && in_region {
             // Hide the system cursor and paint only the custom cursor.
-            ctx.set_cursor_icon(CursorIcon::None);
+            if passthrough {
+                self.set_system_cursor_visible(passthrough, false); // ShowCursor(FALSE)
+            } else {
+                ctx.set_cursor_icon(CursorIcon::None);
+            }
             if let Some(p) = pointer {
                 self.paint_custom_cursor(&ctx, p);
             }
         } else {
-            // Normal system cursor.
+            // Outside the region (or overlay disabled): normal system cursor.
             ctx.set_cursor_icon(CursorIcon::Default);
             ctx.set_cursor_image(None);
+            self.set_system_cursor_visible(passthrough, true); // restore
         }
 
         // ---- settings panel ----
@@ -509,6 +652,13 @@ impl eframe::App for CursorOverlayApp {
 
         // Keep tracking the mouse smoothly even when it is idle.
         ctx.request_repaint();
+    }
+}
+
+impl Drop for CursorOverlayApp {
+    fn drop(&mut self) {
+        // Never leave the system cursor hidden.
+        self.set_system_cursor_visible(true, true);
     }
 }
 

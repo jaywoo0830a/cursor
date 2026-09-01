@@ -9,9 +9,14 @@ follows the mouse. Outside the region the normal system cursor is used.
 
 ## Features
 
-- Region-limited custom cursor (painted, clipped to the overlay window).
+- Region-limited custom cursor: inside the region the system cursor is
+  hidden and replaced by a custom bitmap cursor that follows the mouse;
+  outside it the normal system cursor is used.
+- **Click pass-through (Windows):** clicks go through the overlay to the apps
+  below — only the cursor changes. While the settings panel / region editor is
+  open, pass-through is disabled automatically so the panel stays usable.
 - Optional OS-level bitmap cursor (`Context::set_cursor_image` →
-  `winit::window::CustomCursor`) applied to the whole window.
+  `winit::window::CustomCursor`) applied to the whole window (no click-through).
 - The cursor bitmap comes from `assets/cursor.png` if present, otherwise a
   classic arrow cursor is generated in code (no asset required).
 - Interactive region editor: drag the box to move it, drag the handles to
@@ -22,7 +27,7 @@ follows the mouse. Outside the region the normal system cursor is used.
 | Key / action        | Effect                                    |
 | ------------------- | ----------------------------------------- |
 | `F1`                | Toggle the settings panel                 |
-| `Esc`               | Quit (when not editing the region)        |
+| `Esc`               | Quit                                      |
 | Drag region box     | Move the overlay region (edit mode)       |
 | Drag region handles | Resize the overlay region (edit mode)     |
 
@@ -46,18 +51,22 @@ cargo run --release
    `egui::ViewportBuilder` (`with_transparent`, `with_always_on_top`,
    `with_fullscreen`, `with_decorations(false)`) and `App::clear_color`
    returns a fully transparent color.
-2. Each frame the pointer position is read (`Context::pointer_interact_pos`).
+2. Each frame the pointer position is read. With click pass-through enabled
+   (Windows) the window stops receiving pointer events, so the position is
+   polled with `GetCursorPos` and converted from physical pixels to points;
+   otherwise `Context::pointer_interact_pos` is used.
 3. If the pointer is inside the configured `region` (and the overlay is
    active):
-   - `ctx.set_cursor_icon(CursorIcon::None)` hides the OS cursor
-     (egui-winit maps `None` to `window.set_cursor_visible(false)`), and
+   - the system cursor is hidden — via `ShowCursor(FALSE)` in click-through
+     mode, or `ctx.set_cursor_icon(CursorIcon::None)` otherwise — and
    - the custom bitmap cursor is painted at the pointer position on a top
      layer (`Painter::image`), offset by its hotspot.
-4. Outside the region, `ctx.set_cursor_icon(CursorIcon::Default)` restores the
-   normal system cursor.
+4. Outside the region the system cursor is restored (`ShowCursor(TRUE)` /
+   `CursorIcon::Default`).
 5. Optional native mode: `ctx.set_cursor_image(Some(CustomCursorImage { .. }))`
    registers the RGBA bitmap as a real OS cursor (`egui::CustomCursorImage`),
-   which is not clipped by the window — but applies to the whole window.
+   which is not clipped by the window — but applies to the whole window and is
+   disabled while click pass-through is active.
 
 Key egui 0.36 APIs used:
 
@@ -90,12 +99,12 @@ If the file is absent, a default arrow cursor is generated automatically.
   To change the compile-time default, edit the `[features]` section in
   `Cargo.toml` (`default = ["glow"]` → `default = ["glow", "wgpu"]` or
   `default = ["wgpu"]`).
-- The overlay window captures pointer input over the whole screen (a winit
-  window cannot receive pointer events in only a sub-rectangle). To make
-  clicks pass through to the underlying apps you would combine
-  `ViewportBuilder::with_mouse_passthrough(true)` with an OS-level global
-  pointer tracker (e.g. X11 `XQueryPointer` / `enigo`), since with
-  passthrough enabled the window no longer receives pointer events.
+- **Click pass-through is implemented on Windows only.** With pass-through on,
+  the overlay uses `GetCursorPos` to track the mouse (the window receives no
+  pointer events) and `ShowCursor(FALSE/TRUE)` to hide/show the system cursor
+  (winit's per-window cursor API is ignored for pass-through windows). The
+  `ShowCursor` calls are paired so Windows' global display counter stays
+  balanced, and the cursor is always restored on exit.
 - Transparency requires a compositor on Linux/X11 (e.g. picom, Mutter), and
   works with both the glow and wgpu backends on Windows.
 - The OS-level bitmap cursor mode (`use_os_cursor`) applies to the entire
