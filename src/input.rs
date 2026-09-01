@@ -12,7 +12,13 @@
 //! * **Pen (터치펜) / touch / trackpad** — raw input is registered for the
 //!   HID digitizer usages (pen `0x0D/0x02`, touch screen `0x0D/0x04`, touch
 //!   pad `0x0D/0x05`). Every `WM_INPUT` HID report is decoded best-effort
-//!   (contact, x/y, pressure, tilt) and the raw bytes are also exposed.
+//!   (contact, x/y, pressure, tilt).
+//!
+//! All events are **debounced**: the hook/raw-input handlers merge them into
+//! a small accumulator (latest position/state, summed deltas) and a dedicated
+//! thread flushes the coalesced events to the app at ~1 ms. High-rate HID
+//! devices (pen, touch, high-polling mice) therefore never flood the channel
+//! or the per-frame processing.
 //!
 //! Because the input thread has its own message queue, input keeps flowing
 //! even while the overlay window is click-through (the pointer events go to
@@ -198,8 +204,9 @@ pub fn last_global_mouse_pos() -> Option<(f64, f64)> {
 mod win {
     use super::*;
     use std::mem::size_of;
+    use std::sync::Mutex;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use windows_sys::Win32::UI::Input as kbm;
     use windows_sys::Win32::UI::WindowsAndMessaging as wam;
@@ -208,6 +215,11 @@ mod win {
     static HOOK: AtomicUsize = AtomicUsize::new(0);
     static LAST_POS: AtomicU64 = AtomicU64::new(0);
     static FORCED_CURSOR: AtomicUsize = AtomicUsize::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+    /// Raw input events are merged here and flushed to the app at ~1 ms, so
+    /// high-rate HID devices (pen / touch / high-polling mice) don't flood
+    /// the channel or the per-frame processing.
+    static COALESCER: Mutex<Coalescer> = Mutex::new(Coalescer::new());
 
     // HID usage page / usage values for the devices we subscribe to.
     const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
@@ -216,11 +228,6 @@ mod win {
     const HID_USAGE_DIGITIZER_PEN: u16 = 0x02;
     const HID_USAGE_DIGITIZER_TOUCH_SCREEN: u16 = 0x04;
     const HID_USAGE_DIGITIZER_TOUCH_PAD: u16 = 0x05;
-
-    /// Timer that continuously re-asserts the forced cursor (~15 ms), so any
-    /// cursor change made by an app or driver — e.g. the instant a drawing-
-    /// pad pen touches — is reverted even when no mouse events are flowing.
-    const TIMER_ID: usize = 1;
 
     pub fn start() -> Option<Receiver<InputEvent>> {
         let (tx, rx) = mpsc::channel();
@@ -233,10 +240,17 @@ mod win {
             .name("raw-input".into())
             .spawn(raw_input_thread)
             .ok()?;
+        // ~1 ms debounced flusher: emits the coalesced events and keeps
+        // re-asserting the forced cursor between mouse events.
+        std::thread::Builder::new()
+            .name("raw-flush".into())
+            .spawn(flush_loop)
+            .ok()?;
         Some(rx)
     }
 
     pub fn stop() {
+        STOP.store(true, Ordering::SeqCst);
         let h = HOOK.swap(0, Ordering::SeqCst);
         if h != 0 {
             unsafe {
@@ -273,7 +287,8 @@ mod win {
     }
 
     /// Re-assert the forced cursor (if any) with `SetCursor`. Called from the
-    /// mouse hook, from raw pen/touch input, and from the periodic timer.
+    /// debounced flusher so a cursor change made by an app or driver is
+    /// reverted within ~1–16 ms, even when no mouse events are flowing.
     fn reassert_forced_cursor() {
         let forced = FORCED_CURSOR.load(Ordering::Relaxed);
         if forced != 0 {
@@ -283,57 +298,155 @@ mod win {
         }
     }
 
-    /// Timer callback: keeps re-asserting the forced cursor while set, so an
-    /// app/driver cursor change is undone within ~15 ms.
-    unsafe extern "system" fn timer_proc(
-        _hwnd: *mut core::ffi::c_void,
-        _msg: u32,
-        _id: usize,
-        _time: u32,
-    ) {
-        reassert_forced_cursor();
+    /// Debounced accumulator that merges raw input events arriving faster
+    /// than the flush rate: keeps the latest state, sums deltas, so a ~1 ms
+    /// flush only ever emits a handful of coalesced events.
+    struct Coalescer {
+        mouse_pos: Option<(f64, f64)>,
+        raw_delta: (i32, i32),
+        raw_flags: u16,
+        raw_buttons: u32,
+        wheel: i32,
+        button: Option<(bool, bool, bool)>,
+        pen: Option<Contact>,
+        touch: Option<Contact>,
+        touchpad: Option<(Contact, i32, i32)>,
+        hid_reports: u64,
     }
 
-    /// Global low-level mouse hook: forwards every mouse event with its
-    /// global screen position, and re-asserts the forced cursor (if any) so
-    /// the app under the pointer cannot show its own I-beam / hand / custom
-    /// cursor.
+    impl Coalescer {
+        const fn new() -> Self {
+            Self {
+                mouse_pos: None,
+                raw_delta: (0, 0),
+                raw_flags: 0,
+                raw_buttons: 0,
+                wheel: 0,
+                button: None,
+                pen: None,
+                touch: None,
+                touchpad: None,
+                hid_reports: 0,
+            }
+        }
+
+        fn mouse_move(&mut self, x: f64, y: f64) {
+            self.mouse_pos = Some((x, y));
+        }
+        fn mouse_button(&mut self, left: bool, right: bool, down: bool) {
+            self.button = Some((left, right, down));
+        }
+        fn wheel(&mut self, delta: i32) {
+            self.wheel += delta;
+        }
+        fn raw_mouse(&mut self, dx: i32, dy: i32, flags: u16, buttons: u32) {
+            self.raw_delta.0 += dx;
+            self.raw_delta.1 += dy;
+            self.raw_flags |= flags;
+            self.raw_buttons = buttons;
+        }
+        fn pen(&mut self, c: Contact) {
+            self.pen = Some(c);
+        }
+        fn touch(&mut self, c: Contact) {
+            self.touch = Some(c);
+        }
+        fn touchpad(&mut self, c: Contact, dx: i32, dy: i32) {
+            self.touchpad = Some((c, dx, dy));
+        }
+        fn hid(&mut self) {
+            self.hid_reports += 1;
+        }
+
+        /// Build the coalesced event list and reset the accumulator.
+        fn drain(&mut self) -> Vec<InputEvent> {
+            let mut out = Vec::with_capacity(8);
+            if let Some((x, y)) = self.mouse_pos.take() {
+                out.push(InputEvent::MouseMove { x, y });
+            }
+            if let Some((left, right, down)) = self.button.take() {
+                out.push(InputEvent::MouseButton { left, right, down });
+            }
+            let (dx, dy) = self.raw_delta;
+            if dx != 0 || dy != 0 || self.raw_flags != 0 {
+                out.push(InputEvent::RawMouse {
+                    dx,
+                    dy,
+                    flags: self.raw_flags,
+                    buttons: self.raw_buttons,
+                });
+            }
+            self.raw_delta = (0, 0);
+            self.raw_flags = 0;
+            if self.wheel != 0 {
+                out.push(InputEvent::MouseWheel { delta: self.wheel });
+                self.wheel = 0;
+            }
+            if let Some(c) = self.pen.take() {
+                out.push(InputEvent::Pen { contact: c });
+            }
+            if let Some(c) = self.touch.take() {
+                out.push(InputEvent::Touch { contact: c });
+            }
+            if let Some((c, dx, dy)) = self.touchpad.take() {
+                out.push(InputEvent::Touchpad { contact: c, dx, dy });
+            }
+            if self.hid_reports > 0 {
+                // Raw HID reports are counted (not forwarded byte-for-byte).
+                out.push(InputEvent::HidRaw {
+                    usage_page: 0,
+                    usage: 0,
+                    data: Vec::new(),
+                });
+                self.hid_reports = 0;
+            }
+            out
+        }
+    }
+
+    fn coalesce() -> std::sync::MutexGuard<'static, Coalescer> {
+        COALESCER.lock().unwrap()
+    }
+
+    /// Debounced flusher: every ~1 ms, drain the coalesced events into the
+    /// channel and re-assert the forced cursor. On Windows the actual sleep
+    /// granularity is ~1–16 ms, which is fine because the app only renders at
+    /// ~60 Hz — the point is to coalesce bursts, not to add perceptible
+    /// latency.
+    fn flush_loop() {
+        let period = std::time::Duration::from_millis(1);
+        while !STOP.load(Ordering::SeqCst) {
+            std::thread::sleep(period);
+            let events = {
+                let mut c = COALESCER.lock().unwrap();
+                c.drain()
+            };
+            for ev in events {
+                send(ev);
+            }
+            reassert_forced_cursor();
+        }
+    }
+
+    /// Global low-level mouse hook: merges every mouse event (position,
+    /// buttons, wheel) into the debounced coalescer and tracks the latest
+    /// global position for the low-latency position fallback.
     unsafe extern "system" fn mouse_ll_hook(code: i32, wparam: usize, lparam: isize) -> isize {
         if code >= 0 {
-            reassert_forced_cursor();
             let m = &*(lparam as *const wam::MSLLHOOKSTRUCT);
             let msg = wparam as u32;
             match msg {
                 wam::WM_MOUSEMOVE => {
                     set_last_pos(m.pt.x as f64, m.pt.y as f64);
-                    send(InputEvent::MouseMove {
-                        x: m.pt.x as f64,
-                        y: m.pt.y as f64,
-                    });
+                    coalesce().mouse_move(m.pt.x as f64, m.pt.y as f64);
                 }
-                wam::WM_LBUTTONDOWN => send(InputEvent::MouseButton {
-                    left: true,
-                    right: false,
-                    down: true,
-                }),
-                wam::WM_LBUTTONUP => send(InputEvent::MouseButton {
-                    left: true,
-                    right: false,
-                    down: false,
-                }),
-                wam::WM_RBUTTONDOWN => send(InputEvent::MouseButton {
-                    left: false,
-                    right: true,
-                    down: true,
-                }),
-                wam::WM_RBUTTONUP => send(InputEvent::MouseButton {
-                    left: false,
-                    right: true,
-                    down: false,
-                }),
+                wam::WM_LBUTTONDOWN => coalesce().mouse_button(true, false, true),
+                wam::WM_LBUTTONUP => coalesce().mouse_button(true, false, false),
+                wam::WM_RBUTTONDOWN => coalesce().mouse_button(false, true, true),
+                wam::WM_RBUTTONUP => coalesce().mouse_button(false, true, false),
                 wam::WM_MOUSEWHEEL => {
                     let delta = (m.mouseData >> 16) as u16 as i16 as i32;
-                    send(InputEvent::MouseWheel { delta });
+                    coalesce().wheel(delta);
                 }
                 _ => {}
             }
@@ -440,15 +553,6 @@ mod win {
                 HOOK.store(hook as usize, Ordering::SeqCst);
             }
 
-            // Continuous re-assertion timer: reverts any app/driver cursor
-            // change within ~15 ms, even with no mouse events flowing.
-            wam::SetTimer(
-                std::ptr::null_mut(),
-                TIMER_ID,
-                15,
-                Some(timer_proc),
-            );
-
             let mut msg = std::mem::zeroed::<wam::MSG>();
             while wam::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                 if msg.message == wam::WM_INPUT {
@@ -459,7 +563,6 @@ mod win {
                 }
             }
 
-            wam::KillTimer(std::ptr::null_mut(), TIMER_ID);
             if !hook.is_null() {
                 wam::UnhookWindowsHookEx(hook);
             }
@@ -472,10 +575,6 @@ mod win {
         lparam: isize,
         usage_map: &std::collections::HashMap<usize, (u16, u16)>,
     ) {
-        // Pen/touch raw input may not produce mouse messages; re-assert the
-        // forced cursor here too so a pen touch can't leave the app's cursor.
-        reassert_forced_cursor();
-
         let mut size: u32 = 0;
         let header = size_of::<kbm::RAWINPUTHEADER>() as u32;
         kbm::GetRawInputData(
@@ -509,15 +608,10 @@ mod win {
                 } else {
                     (m.lLastX, m.lLastY)
                 };
-                send(InputEvent::RawMouse {
-                    dx,
-                    dy,
-                    flags: btns.usButtonFlags,
-                    buttons: m.ulRawButtons,
-                });
+                let mut c = COALESCER.lock().unwrap();
+                c.raw_mouse(dx, dy, btns.usButtonFlags, m.ulRawButtons);
                 if (btns.usButtonFlags as u32) & wam::RI_MOUSE_WHEEL != 0 {
-                    let delta = btns.usButtonData as i16 as i32;
-                    send(InputEvent::MouseWheel { delta });
+                    c.wheel(btns.usButtonData as i16 as i32);
                 }
             }
             kbm::RIM_TYPEHID => {
@@ -526,48 +620,32 @@ mod win {
                 let bytes = std::slice::from_raw_parts(hid.bRawData.as_ptr(), n.min(256));
                 let Some((page, usage)) = usage_map.get(&(raw.header.hDevice as usize)).copied()
                 else {
-                    send(InputEvent::HidRaw {
-                        usage_page: 0,
-                        usage: 0,
-                        data: bytes.to_vec(),
-                    });
+                    coalesce().hid();
                     return;
                 };
                 if page == HID_USAGE_PAGE_DIGITIZER {
                     match usage {
                         HID_USAGE_DIGITIZER_PEN => {
                             if let Some(c) = decode_contact(bytes) {
-                                send(InputEvent::Pen { contact: c });
+                                coalesce().pen(c);
                             }
                         }
                         HID_USAGE_DIGITIZER_TOUCH_SCREEN => {
                             if let Some(c) = decode_contact(bytes) {
-                                send(InputEvent::Touch { contact: c });
+                                coalesce().touch(c);
                             }
                         }
                         HID_USAGE_DIGITIZER_TOUCH_PAD => {
                             if let Some(c) = decode_contact(bytes) {
                                 // Touch pads report absolute contact positions;
                                 // relative motion arrives as RawMouse deltas.
-                                send(InputEvent::Touchpad {
-                                    contact: c,
-                                    dx: 0,
-                                    dy: 0,
-                                });
+                                coalesce().touchpad(c, 0, 0);
                             }
                         }
-                        _ => send(InputEvent::HidRaw {
-                            usage_page: page,
-                            usage,
-                            data: bytes.to_vec(),
-                        }),
+                        _ => coalesce().hid(),
                     }
                 } else {
-                    send(InputEvent::HidRaw {
-                        usage_page: page,
-                        usage,
-                        data: bytes.to_vec(),
-                    });
+                    coalesce().hid();
                 }
             }
             _ => {}
@@ -585,8 +663,8 @@ mod win {
     ///   [8]     tilt X (8-bit signed), [9] tilt Y (8-bit signed)
     /// ```
     ///
-    /// The layout differs between devices; the raw bytes are always available
-    /// via `InputEvent::HidRaw` as the authoritative fallback.
+    /// The layout differs between devices; the debounced pipeline counts
+    /// unrecognized reports (`HidRaw`) instead of forwarding every raw byte.
     fn decode_contact(data: &[u8]) -> Option<Contact> {
         if data.len() < 6 {
             return None;

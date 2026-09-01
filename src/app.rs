@@ -99,6 +99,9 @@ pub struct CursorOverlayApp {
     /// Last time the system-cursor swap was re-asserted (Windows).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     last_swap_reassert: std::time::Instant,
+    /// Last time just the arrow (`OCR_NORMAL`) was re-asserted (Windows).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    last_normal_reassert: std::time::Instant,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -207,6 +210,7 @@ impl CursorOverlayApp {
             raw,
             out_region_frames: 0,
             last_swap_reassert: std::time::Instant::now(),
+            last_normal_reassert: std::time::Instant::now(),
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -609,7 +613,8 @@ impl CursorOverlayApp {
                     ui.weak(
                         "Pen / touch / trackpad are captured raw via HID raw input\n\
                          (pen 0x0D/0x02, touch 0x0D/0x04, touch pad 0x0D/0x05);\n\
-                         pressure/tilt are best-effort decodes of the HID report.",
+                         pressure/tilt are best-effort decodes. Events are\n\
+                         debounced (~1 ms) for performance.",
                     );
                 } else {
                     ui.weak("Raw input is only available on Windows.");
@@ -758,10 +763,19 @@ impl eframe::App for CursorOverlayApp {
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
                 platform::set_system_cursor_active(in_region_eff, self.hcursor);
+                // Re-assert just the arrow at high rate (~60 Hz) so a driver
+                // revert — which flashes the system arrow — is undone within
+                // a single frame.
+                if self.last_normal_reassert.elapsed()
+                    >= std::time::Duration::from_millis(16)
+                {
+                    self.last_normal_reassert = std::time::Instant::now();
+                    platform::reassert_normal_cursor_swap();
+                }
                 // Some tablet drivers revert the system cursors (e.g. via
                 // SPI_SETCURSORS) the instant the pen touches; re-apply the
-                // swap immediately on pen/touch events and periodically so
-                // the circle always comes back.
+                // full swap immediately on pen/touch events and periodically
+                // so the circle always comes back.
                 if raw_pointer
                     || self.last_swap_reassert.elapsed()
                         >= std::time::Duration::from_millis(250)

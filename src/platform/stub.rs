@@ -42,4 +42,6 @@ pub fn set_system_cursor_active(_active: bool, _custom: usize) {}
 
 pub fn reassert_system_cursor_swap() {}
 
+pub fn reassert_normal_cursor_swap() {}
+
 pub fn restore_system_cursor_swap() {}
