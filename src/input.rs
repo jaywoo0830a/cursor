@@ -217,6 +217,11 @@ mod win {
     const HID_USAGE_DIGITIZER_TOUCH_SCREEN: u16 = 0x04;
     const HID_USAGE_DIGITIZER_TOUCH_PAD: u16 = 0x05;
 
+    /// Timer that continuously re-asserts the forced cursor (~15 ms), so any
+    /// cursor change made by an app or driver — e.g. the instant a drawing-
+    /// pad pen touches — is reverted even when no mouse events are flowing.
+    const TIMER_ID: usize = 1;
+
     pub fn start() -> Option<Receiver<InputEvent>> {
         let (tx, rx) = mpsc::channel();
         if EVENT_TX.set(tx).is_err() {
@@ -267,16 +272,35 @@ mod win {
         }
     }
 
+    /// Re-assert the forced cursor (if any) with `SetCursor`. Called from the
+    /// mouse hook, from raw pen/touch input, and from the periodic timer.
+    fn reassert_forced_cursor() {
+        let forced = FORCED_CURSOR.load(Ordering::Relaxed);
+        if forced != 0 {
+            unsafe {
+                wam::SetCursor(forced as *mut core::ffi::c_void);
+            }
+        }
+    }
+
+    /// Timer callback: keeps re-asserting the forced cursor while set, so an
+    /// app/driver cursor change is undone within ~15 ms.
+    unsafe extern "system" fn timer_proc(
+        _hwnd: *mut core::ffi::c_void,
+        _msg: u32,
+        _id: usize,
+        _time: u32,
+    ) {
+        reassert_forced_cursor();
+    }
+
     /// Global low-level mouse hook: forwards every mouse event with its
     /// global screen position, and re-asserts the forced cursor (if any) so
     /// the app under the pointer cannot show its own I-beam / hand / custom
     /// cursor.
     unsafe extern "system" fn mouse_ll_hook(code: i32, wparam: usize, lparam: isize) -> isize {
         if code >= 0 {
-            let forced = FORCED_CURSOR.load(Ordering::Relaxed);
-            if forced != 0 {
-                wam::SetCursor(forced as *mut core::ffi::c_void);
-            }
+            reassert_forced_cursor();
             let m = &*(lparam as *const wam::MSLLHOOKSTRUCT);
             let msg = wparam as u32;
             match msg {
@@ -416,6 +440,15 @@ mod win {
                 HOOK.store(hook as usize, Ordering::SeqCst);
             }
 
+            // Continuous re-assertion timer: reverts any app/driver cursor
+            // change within ~15 ms, even with no mouse events flowing.
+            wam::SetTimer(
+                std::ptr::null_mut(),
+                TIMER_ID,
+                15,
+                Some(timer_proc),
+            );
+
             let mut msg = std::mem::zeroed::<wam::MSG>();
             while wam::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                 if msg.message == wam::WM_INPUT {
@@ -426,6 +459,7 @@ mod win {
                 }
             }
 
+            wam::KillTimer(std::ptr::null_mut(), TIMER_ID);
             if !hook.is_null() {
                 wam::UnhookWindowsHookEx(hook);
             }
@@ -438,6 +472,10 @@ mod win {
         lparam: isize,
         usage_map: &std::collections::HashMap<usize, (u16, u16)>,
     ) {
+        // Pen/touch raw input may not produce mouse messages; re-assert the
+        // forced cursor here too so a pen touch can't leave the app's cursor.
+        reassert_forced_cursor();
+
         let mut size: u32 = 0;
         let header = size_of::<kbm::RAWINPUTHEADER>() as u32;
         kbm::GetRawInputData(

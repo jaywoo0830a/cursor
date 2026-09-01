@@ -92,6 +92,11 @@ pub struct CursorOverlayApp {
     /// Latest decoded raw-input state (shown in the settings panel).
     raw: InputSnapshot,
 
+    /// Consecutive frames the pointer was outside the region. Used for
+    /// hysteresis so a brief glitch (e.g. a drawing-pad pen touch) doesn't
+    /// disable the forced circle.
+    out_region_frames: u32,
+
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
     drag_start_region: Rect,
@@ -197,6 +202,7 @@ impl CursorOverlayApp {
             hcursor,
             raw_rx,
             raw,
+            out_region_frames: 0,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -705,13 +711,23 @@ impl eframe::App for CursorOverlayApp {
         // ---- custom cursor behavior ----
         let in_region = pointer.is_some_and(|p| self.region.contains(p));
 
+        // Hysteresis: a drawing-pad pen can briefly glitch the reported
+        // position the instant it touches, so don't disable the forced circle
+        // on a single out-of-region frame — only after a few consecutive ones.
+        if in_region {
+            self.out_region_frames = 0;
+        } else {
+            self.out_region_frames = self.out_region_frames.saturating_add(1);
+        }
+        let in_region_eff = self.out_region_frames < 3;
+
         // Re-assert the custom circle from the global mouse hook on every
         // mouse event (Windows), so apps that set their own cursor — e.g. an
         // I-beam while typing or a hand while hovering — still show our
         // circle. Only active in OS mode while the pointer is inside the
         // region.
         input::set_forced_cursor(
-            if os_mode && in_region && self.hcursor != 0 {
+            if os_mode && in_region_eff && self.hcursor != 0 {
                 Some(self.hcursor)
             } else {
                 None
@@ -726,7 +742,7 @@ impl eframe::App for CursorOverlayApp {
             // frame so an app (e.g. a PDF viewer's canvas) cannot override us.
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
-                platform::set_system_cursor_active(in_region, self.hcursor);
+                platform::set_system_cursor_active(in_region_eff, self.hcursor);
             }
             if in_region {
                 ctx.set_cursor_image(Some(self.os_cursor.clone()));
