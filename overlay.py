@@ -343,11 +343,24 @@ class CursorOverlay(QWidget):
         # Never activate the overlay itself.
         if msg.message == input_forward.WM_MOUSEACTIVATE:
             return True, input_forward.MA_NOACTIVATE
-        # A press (mouse or pen) starts a stroke: become click-through so the
-        # app below receives the real input (pen pressure included).
-        if msg.message == input_forward.WM_POINTERDOWN:
-            self._begin_stroke(input_forward.WM_LBUTTONDOWN)  # pen = left button
+        # Claim pointer input so Windows does not draw the Windows Ink pen
+        # hover cursor over our overlay (a window that handles WM_POINTER*
+        # manages its own cursor).  Also track the pen position from it.
+        if input_forward.WM_POINTERUPDATE <= msg.message <= input_forward.WM_POINTER_LAST:
+            if msg.message == input_forward.WM_POINTERDOWN:
+                self._begin_stroke(input_forward.WM_LBUTTONDOWN)  # pen = left button
+            elif msg.message == input_forward.WM_POINTERUPDATE:
+                x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                self.last_pos = QPoint(x, y)
+                self.update()
+            ctypes.windll.user32.SetCursor(None)
             return True, 0
+        # Disable pen press-and-hold (right-click ring) inside the overlay.
+        if msg.message == input_forward.WM_TABLET_QUERYSYSTEMGESTURESTATUS:
+            return True, input_forward.TABLET_DISABLE_PRESSANDHOLD
+        # A mouse-button press starts a stroke: become click-through so the
+        # app below receives the real input.
         if msg.message in input_forward.DOWN_TO_FLAGS:
             self._begin_stroke(msg.message)
             return True, 0
