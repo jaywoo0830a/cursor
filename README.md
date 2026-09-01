@@ -3,22 +3,24 @@
 A transparent, frameless, always-on-top, fullscreen overlay written in Rust
 with [egui 0.36.1](https://docs.rs/egui/latest/egui/) / eframe 0.36.1.
 
-**Within a user-defined overlay region, only a custom cursor appears.** The
-system cursor is hidden there and replaced by a custom bitmap cursor that
-follows the mouse. Outside the region the normal system cursor is used.
+**Within a user-defined overlay region, only a custom cursor (a small circle)
+appears**; the background is fully transparent and clicks pass through to the
+apps below (Windows). Outside the region the normal system cursor is used.
 
 ## Features
 
-- Region-limited custom cursor: inside the region the system cursor is
-  hidden and replaced by a custom bitmap cursor that follows the mouse;
-  outside it the normal system cursor is used.
+- **Fully transparent background** by default: no settings panel and no
+  region outline on startup — only the custom cursor is drawn.
+- **Small circular custom cursor** (white circle with a dark ring), hotspot at
+  the center. Replace it with your own bitmap via `assets/cursor.png`.
+- Region-limited behavior: inside the region the system cursor is hidden and
+  replaced by the custom cursor; outside it the normal system cursor is used.
 - **Click pass-through (Windows):** clicks go through the overlay to the apps
-  below — only the cursor changes. While the settings panel / region editor is
-  open, pass-through is disabled automatically so the panel stays usable.
+  below — only the cursor changes. Set on the window at creation time and
+  kept in sync at runtime. While the settings panel / region editor is open,
+  pass-through is disabled automatically so the panel stays usable.
 - Optional OS-level bitmap cursor (`Context::set_cursor_image` →
   `winit::window::CustomCursor`) applied to the whole window (no click-through).
-- The cursor bitmap comes from `assets/cursor.png` if present, otherwise a
-  classic arrow cursor is generated in code (no asset required).
 - Interactive region editor: drag the box to move it, drag the handles to
   resize it. Presets: Reset / Center / Fullscreen.
 
@@ -79,7 +81,7 @@ Key egui 0.36 APIs used:
 
 Drop a straight-RGBA PNG at `assets/cursor.png` (default hotspot `[0, 0]`,
 editable via `PNG_HOTSPOT` in `src/main.rs`). Keep it small (e.g. 32×32).
-If the file is absent, a default arrow cursor is generated automatically.
+If the file is absent, a small circular cursor is generated automatically.
 
 ## Notes & limitations
 

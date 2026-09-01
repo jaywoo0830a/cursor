@@ -48,7 +48,7 @@ fn default_region() -> Rect {
 }
 
 /// Logical display size (in points) of the *painted* custom cursor.
-const CURSOR_DISPLAY_SIZE: f32 = 24.0;
+const CURSOR_DISPLAY_SIZE: f32 = 20.0;
 
 /// Optional PNG used as the cursor bitmap (straight / non-premultiplied RGBA).
 /// If missing, a default arrow cursor is generated at runtime.
@@ -122,7 +122,7 @@ struct CursorBitmap {
     hotspot: [u16; 2],
 }
 
-/// Try to load `assets/cursor.png`; fall back to a generated arrow cursor.
+/// Try to load `assets/cursor.png`; fall back to a generated circular cursor.
 fn load_cursor_bitmap() -> CursorBitmap {
     let path = Path::new(CURSOR_PNG);
     if let Ok(img) = image::open(path) {
@@ -141,44 +141,24 @@ fn load_cursor_bitmap() -> CursorBitmap {
     make_default_cursor()
 }
 
-/// Rasterize a classic arrow pointer (32x32, white outline + black fill).
+/// Rasterize a small circular cursor (white fill, dark ring), hotspot at the
+/// center, so it stays readable on both light and dark backgrounds.
 fn make_default_cursor() -> CursorBitmap {
     const S: usize = 32;
-    // Simple, non-self-intersecting arrow polygon (tip at top-left).
-    const P: &[(f32, f32)] = &[
-        (1.0, 1.0),  // tip
-        (1.0, 25.0), // bottom of the shaft
-        (7.0, 25.0),
-        (7.0, 13.0),
-        (17.0, 21.0), // tail (bottom)
-        (21.0, 17.0), // tail (end)
-        (11.0, 9.0),  // tail (top)
-        (19.0, 9.0),  // right edge
-        (8.0, 1.0),   // top right
-    ];
-
-    let mut grid = [[false; S]; S];
-    for y in 0..S {
-        for x in 0..S {
-            grid[y][x] = point_in_polygon(x as f32 + 0.5, y as f32 + 0.5, P);
-        }
-    }
+    const CX: f32 = (S as f32 - 1.0) * 0.5; // 15.5
+    const CY: f32 = (S as f32 - 1.0) * 0.5;
+    const R_INNER: f32 = 10.5; // white fill
+    const R_OUTER: f32 = 15.0; // dark outline
 
     let mut rgba = vec![0u8; S * S * 4];
     for y in 0..S {
         for x in 0..S {
+            let d = ((x as f32 - CX).powi(2) + (y as f32 - CY).powi(2)).sqrt();
             let i = (y * S + x) * 4;
-            if grid[y][x] {
-                rgba[i..i + 4].copy_from_slice(&[0, 0, 0, 255]); // black fill
-            } else {
-                // 1px white outline around the shape.
-                let border = (x > 0 && grid[y][x - 1])
-                    || (x + 1 < S && grid[y][x + 1])
-                    || (y > 0 && grid[y - 1][x])
-                    || (y + 1 < S && grid[y + 1][x]);
-                if border {
-                    rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
-                }
+            if d <= R_INNER {
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            } else if d <= R_OUTER {
+                rgba[i..i + 4].copy_from_slice(&[20, 20, 20, 255]);
             }
         }
     }
@@ -186,24 +166,8 @@ fn make_default_cursor() -> CursorBitmap {
     CursorBitmap {
         rgba: Arc::from(rgba),
         size: [S as u16, S as u16],
-        hotspot: [2, 2],
+        hotspot: [S as u16 / 2, S as u16 / 2],
     }
-}
-
-/// Ray-casting point-in-polygon test.
-fn point_in_polygon(px: f32, py: f32, poly: &[(f32, f32)]) -> bool {
-    let mut inside = false;
-    let n = poly.len();
-    let mut j = n - 1;
-    for i in 0..n {
-        let (xi, yi) = poly[i];
-        let (xj, yj) = poly[j];
-        if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi) {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
 }
 
 // ---------------------------------------------------------------------------
@@ -290,11 +254,13 @@ impl CursorOverlayApp {
             texture,
             os_cursor,
             region: default_region(),
-            show_settings: true,
+            // Start with the overlay active: no settings panel and no region
+            // outline — just the transparent background and the cursor.
+            show_settings: false,
             editing: false,
             enabled: true,
             use_os_cursor: false,
-            show_region_visual: true,
+            show_region_visual: false,
             // Click pass-through is only implemented on Windows (global
             // cursor polling via GetCursorPos).
             #[cfg(target_os = "windows")]
@@ -417,21 +383,25 @@ impl CursorOverlayApp {
     /// global `ShowCursor` API (winit's per-window cursor is ignored for
     /// transparent/pass-through windows). The calls are paired to keep
     /// Windows' display counter balanced.
-    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     fn set_system_cursor_visible(&mut self, passthrough: bool, visible: bool) {
-        if !passthrough {
-            return;
-        }
         #[cfg(target_os = "windows")]
         {
-            if !visible && !self.cursor_hidden {
-                platform::set_system_cursor_visible(false);
-                self.cursor_hidden = true;
-            } else if visible && self.cursor_hidden {
+            if passthrough {
+                if !visible && !self.cursor_hidden {
+                    platform::set_system_cursor_visible(false);
+                    self.cursor_hidden = true;
+                } else if visible && self.cursor_hidden {
+                    platform::set_system_cursor_visible(true);
+                    self.cursor_hidden = false;
+                }
+            } else if self.cursor_hidden {
+                // Left click-through mode; make sure the cursor is restored.
                 platform::set_system_cursor_visible(true);
                 self.cursor_hidden = false;
             }
         }
+        #[cfg(not(target_os = "windows"))]
+        let _ = (passthrough, visible);
     }
 
     /// Draw the region rectangle (+ handles while editing).
@@ -593,12 +563,16 @@ impl eframe::App for CursorOverlayApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // ---- click pass-through ----
-        // Enabled only while the window is not needed for interaction
-        // (settings panel and region editing closed) and only on Windows,
-        // where we can poll the global cursor position.
+        // ---- overlay mode ----
+        // The region-limited custom cursor runs in "overlay mode". On Windows
+        // this is only fully correct with click pass-through enabled: the
+        // system cursor is hidden/shown per-region via ShowCursor and the
+        // position is polled with GetCursorPos. While the settings panel or
+        // region editor is open, pass-through is disabled so the panel stays
+        // interactive and the normal system cursor is used.
+        let overlay_on = self.enabled && !self.editing && !self.show_settings;
         #[cfg(target_os = "windows")]
-        let passthrough = self.passthrough && !self.show_settings && !self.editing;
+        let passthrough = self.passthrough && overlay_on;
         #[cfg(not(target_os = "windows"))]
         let passthrough = false;
 
@@ -615,34 +589,53 @@ impl eframe::App for CursorOverlayApp {
             self.handle_region_drag(&ctx, pointer);
         }
 
-        // ---- draw the region (visual guide, always drawn faintly) ----
+        // ---- draw the region (only while editing / when toggled on) ----
         self.paint_region(ui);
 
         // ---- custom cursor behavior ----
-        let active = self.enabled && !self.editing;
         let in_region = pointer.is_some_and(|p| self.region.contains(p));
 
-        if active && self.use_os_cursor && !passthrough {
-            // Native OS-level bitmap cursor: not region-limited, but a real,
-            // un-clipped cursor provided by the OS/winit (no click-through).
+        if overlay_on && passthrough {
+            // Region-limited custom cursor (Windows click-through path):
+            // hide the system cursor only inside the region and draw ours.
+            if in_region {
+                self.set_system_cursor_visible(true, false); // ShowCursor(FALSE)
+                if let Some(p) = pointer {
+                    self.paint_custom_cursor(&ctx, p);
+                }
+            } else {
+                self.set_system_cursor_visible(true, true); // ShowCursor(TRUE)
+            }
+        } else if overlay_on && self.use_os_cursor {
+            // Native OS-level bitmap cursor (no click-through).
             ctx.set_cursor_image(Some(self.os_cursor.clone()));
             ctx.set_cursor_icon(CursorIcon::Default);
-            self.set_system_cursor_visible(passthrough, true);
-        } else if active && in_region {
-            // Hide the system cursor and paint only the custom cursor.
-            if passthrough {
-                self.set_system_cursor_visible(passthrough, false); // ShowCursor(FALSE)
-            } else {
-                ctx.set_cursor_icon(CursorIcon::None);
-            }
+            self.set_system_cursor_visible(false, true);
+        } else if overlay_on && in_region {
+            // Fallback without click-through (e.g. non-Windows): hide the
+            // cursor over the whole window and paint the custom cursor.
+            ctx.set_cursor_icon(CursorIcon::None);
             if let Some(p) = pointer {
                 self.paint_custom_cursor(&ctx, p);
             }
+            self.set_system_cursor_visible(false, true);
         } else {
-            // Outside the region (or overlay disabled): normal system cursor.
+            // Overlay paused or pointer outside the region: normal cursor.
             ctx.set_cursor_icon(CursorIcon::Default);
             ctx.set_cursor_image(None);
-            self.set_system_cursor_visible(passthrough, true); // restore
+            self.set_system_cursor_visible(false, true); // restore OS cursor
+        }
+
+        // ---- subtle hint while the panel is closed ----
+        if !self.show_settings && !self.editing {
+            let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("hint")));
+            painter.text(
+                egui::pos2(8.0, 6.0),
+                egui::Align2::LEFT_TOP,
+                "F1: settings  ·  Esc: quit",
+                FontId::proportional(11.0),
+                Color32::from_gray(210).gamma_multiply(0.35),
+            );
         }
 
         // ---- settings panel ----
@@ -723,15 +716,24 @@ fn main() -> eframe::Result {
     let renderer = select_renderer();
     log::info!("Using the {renderer:?} renderer");
 
+    let viewport = ViewportBuilder::default()
+        .with_app_id("custom_cursor_overlay")
+        .with_title("Custom Cursor Overlay")
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_fullscreen(true);
+
+    // The overlay starts with the settings panel closed, so click
+    // pass-through is enabled from the very first frame on Windows.
+    #[cfg(target_os = "windows")]
+    let viewport = viewport.with_mouse_passthrough(true);
+    #[cfg(not(target_os = "windows"))]
+    let viewport = viewport.with_mouse_passthrough(false);
+
     let native_options = eframe::NativeOptions {
         renderer,
-        viewport: ViewportBuilder::default()
-            .with_app_id("custom_cursor_overlay")
-            .with_title("Custom Cursor Overlay")
-            .with_decorations(false)
-            .with_transparent(true)
-            .with_always_on_top()
-            .with_fullscreen(true),
+        viewport,
         ..Default::default()
     };
 
