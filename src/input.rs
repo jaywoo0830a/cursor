@@ -599,28 +599,88 @@ mod win {
         wam::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
     }
 
+    /// Create a hidden message-only window owned by the current thread, used
+    /// as the raw-input sink. `RIDEV_INPUTSINK` requires a valid `hwndTarget`,
+    /// and a message-only window is the standard way to receive `WM_INPUT` on
+    /// a background thread. Returns the HWND (as isize) or 0 on failure.
+    unsafe fn create_message_sink() -> isize {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, RegisterClassExW, WNDCLASSEXW,
+        };
+        unsafe extern "system" fn sink_proc(
+            hwnd: *mut core::ffi::c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        const CLASS_NAME: &str = "CustomCursorOverlayRawSink";
+        let class_w: Vec<u16> = CLASS_NAME
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(sink_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: std::ptr::null_mut(),
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_w.as_ptr(),
+            hIconSm: std::ptr::null_mut(),
+        };
+        RegisterClassExW(&wc);
+        let hwnd = CreateWindowExW(
+            0,
+            class_w.as_ptr(),
+            class_w.as_ptr(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            (-3isize) as *mut core::ffi::c_void, // HWND_MESSAGE
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        hwnd as isize
+    }
+
     /// The raw-input thread: installs the mouse + keyboard hooks, registers HID
     /// digitizer devices and runs its own message loop.
     fn raw_input_thread() {
         unsafe {
+            // RIDEV_INPUTSINK requires a valid hwndTarget; use a message-only
+            // window owned by this thread so WM_INPUT lands in our loop.
+            let sink = create_message_sink();
+            if sink == 0 {
+                log::warn!("failed to create raw-input sink window");
+            }
+            let sink_hwnd = sink as *mut core::ffi::c_void;
             let devices = [
                 kbm::RAWINPUTDEVICE {
                     usUsagePage: HID_USAGE_PAGE_GENERIC,
                     usUsage: HID_USAGE_GENERIC_MOUSE,
                     dwFlags: kbm::RIDEV_INPUTSINK,
-                    hwndTarget: std::ptr::null_mut(),
+                    hwndTarget: sink_hwnd,
                 },
                 kbm::RAWINPUTDEVICE {
                     usUsagePage: HID_USAGE_PAGE_DIGITIZER,
                     usUsage: HID_USAGE_DIGITIZER_PEN,
                     dwFlags: kbm::RIDEV_INPUTSINK,
-                    hwndTarget: std::ptr::null_mut(),
+                    hwndTarget: sink_hwnd,
                 },
                 kbm::RAWINPUTDEVICE {
                     usUsagePage: HID_USAGE_PAGE_DIGITIZER,
                     usUsage: HID_USAGE_DIGITIZER_TOUCH_SCREEN,
                     dwFlags: kbm::RIDEV_INPUTSINK,
-                    hwndTarget: std::ptr::null_mut(),
+                    hwndTarget: sink_hwnd,
                 },
             ];
             let cb = size_of::<kbm::RAWINPUTDEVICE>() as u32;

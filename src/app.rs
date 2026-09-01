@@ -283,17 +283,27 @@ impl App {
         self.status_cache = self.status_text(owning, pen_active);
 
         let fp = format!(
-            "{}|{}|{}|{}|{}|{}|{:?}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{:?}|{}",
             self.enabled,
             self.editing,
             self.show_region,
             owning,
             passthrough,
             pen_active,
+            in_region_eff,
             self.region,
             self.status_cache
         );
         let dirty = fp != self.last_fp;
+        if dirty {
+            log::debug!(
+                "owning={owning} passthrough={passthrough} pen={pen_active} in_region={in_region_eff} found={} editing={} enabled={} pointer=({plx:.0},{ply:.0}) cursor={}",
+                self.window_follow_active,
+                self.editing,
+                self.enabled,
+                self.hcursor
+            );
+        }
         self.last_fp = fp;
         dirty
     }
