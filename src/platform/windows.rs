@@ -242,12 +242,17 @@ pub fn set_forwarding(enabled: bool, our_hwnd: usize) {
 }
 
 /// Topmost visible top-level window (excluding `exclude`) whose rect contains
-/// `(x, y)`, walking the Z-order downward from the top.
+/// `(x, y)`, walking the Z-order downward from the top — then digs to the
+/// **deepest child** at that point (`RealChildWindowFromPoint`) so forwarded
+/// mouse messages reach canvases / panes and hover effects work in them.
 fn window_below_at(x: i32, y: i32, exclude: usize) -> Option<HWND> {
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetTopWindow, GetWindow, GetWindowRect, IsIconic, IsWindowVisible, GW_HWNDNEXT,
+        GetTopWindow, GetWindow, GetWindowRect, IsIconic, IsWindowVisible,
+        RealChildWindowFromPoint, GW_HWNDNEXT,
     };
     unsafe {
+        let mut top: HWND = std::ptr::null_mut();
         let mut h = GetTopWindow(std::ptr::null_mut());
         while !h.is_null() {
             if h as usize != exclude && IsWindowVisible(h) != 0 && IsIconic(h) == 0 {
@@ -258,23 +263,37 @@ fn window_below_at(x: i32, y: i32, exclude: usize) -> Option<HWND> {
                     && y >= r.top
                     && y < r.bottom
                 {
-                    return Some(h);
+                    top = h;
+                    break;
                 }
             }
             h = GetWindow(h, GW_HWNDNEXT);
         }
-        None
+        if top.is_null() {
+            return None;
+        }
+        let mut pt = windows_sys::Win32::Foundation::POINT { x, y };
+        ScreenToClient(top, &mut pt);
+        let child = RealChildWindowFromPoint(top, pt);
+        if !child.is_null() {
+            Some(child)
+        } else {
+            Some(top)
+        }
     }
 }
 
 /// Replay one pointer message to the window below our overlay.
-/// `wparam` is the message's wParam (modifier keys / wheel-delta high word).
+/// `wparam` is the message's wParam (mouse-key/modifier flags, wheel delta,
+/// X-button id). Wheel messages (`WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL`) carry
+/// **screen** coordinates in lParam; all other mouse messages carry **client**
+/// coordinates, so we convert with `ScreenToClient`.
 pub fn forward_mouse(pt_x: i32, pt_y: i32, msg: u32, wparam: usize) {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        PostMessageW, SetForegroundWindow, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
-        WM_XBUTTONDOWN,
+        PostMessageW, SetForegroundWindow, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEHWHEEL,
+        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_XBUTTONDOWN,
     };
     if !FORWARD_ON.load(Ordering::Relaxed) {
         return;
@@ -284,10 +303,16 @@ pub fn forward_mouse(pt_x: i32, pt_y: i32, msg: u32, wparam: usize) {
         let Some(hwnd) = window_below_at(pt_x, pt_y, exclude) else {
             return;
         };
-        let mut pt = POINT { x: pt_x, y: pt_y };
-        ScreenToClient(hwnd, &mut pt);
-        let lparam = (((pt.y as u32) & 0xFFFF) as usize) << 16
-            | ((pt.x as u32) & 0xFFFF) as usize;
+        // Wheel messages use screen coordinates; everything else uses client.
+        let (lx, ly) = if matches!(msg, WM_MOUSEWHEEL | WM_MOUSEHWHEEL) {
+            (pt_x, pt_y)
+        } else {
+            let mut pt = POINT { x: pt_x, y: pt_y };
+            ScreenToClient(hwnd, &mut pt);
+            (pt.x, pt.y)
+        };
+        let lparam =
+            (((ly as u32) & 0xFFFF) as usize) << 16 | ((lx as u32) & 0xFFFF) as usize;
         // Activate the target on press so clicks behave naturally.
         if matches!(
             msg,

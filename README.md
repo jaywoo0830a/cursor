@@ -52,10 +52,14 @@ HCURSOR**를 `SetCursor`로 지정하므로 OS가 그 창의 커서로 우리 �
 3. **커서 (Rust)** — `owning` 상태면 Rust가 `SetCursor(우리 HCURSOR)`를 매 틱마다
    재단언 → OS가 우리 원을 그림. 웹뷰는 owning 중 `cursor:none`이라 간섭하지 않음.
    JS 커서 루프가 없어 렉 원인이 제거됩니다. (영역 편집 중엔 기본 화살표)
-4. **포워딩 (Rust)** — 오버레이가 입력을 가로챘으므로 `forward_mouse`가
-   `PostMessageW`(ScreenToClient 좌표 + 버튼 다운 시 SetForegroundWindow)로
-   아래 창에 재생성 메시지를 보내 정상 동작하게 합니다. (상호작용 UI가 없으므로
-   별도 차단 영역 불필요)
+4. **포워딩 (Rust, 100% 입력)** — 오버레이가 입력을 가로챈 동안 `forward_mouse`가
+   아래 창에 **모든 마우스 입력을 실시간으로 재생성**(`PostMessageW`)합니다:
+   이동(드래그 키 상태 포함), 좌/우/중간/X 버튼, 세로+가로 휠, Ctrl/Shift 수정자.
+   휠은 화면 좌표, 그 외는 `ScreenToClient` 클라이언트 좌표, 버튼 다운 시
+   `SetForegroundWindow`로 활성화. 대상은 포인트 아래 **가장 깊은 자식 창**
+   (`RealChildWindowFromPoint`)이라 캔버스/패인의 **호버 효과가 실제 커서처럼**
+   동작합니다. 펜은 클릭통과 전환으로 아래 앱이 진짜 Windows Ink 스트로크를 직접
+   받습니다. (상호작용 UI가 없으므로 별도 차단 영역 불필요)
 
 ## 실행
 

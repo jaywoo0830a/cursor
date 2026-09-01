@@ -222,7 +222,7 @@ mod win {
     use std::mem::size_of;
     use std::sync::Mutex;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use windows_sys::Win32::UI::Input as kbm;
     use windows_sys::Win32::UI::WindowsAndMessaging as wam;
@@ -233,6 +233,9 @@ mod win {
     static LAST_POS: AtomicU64 = AtomicU64::new(0);
     /// Pending hotkey id (0 = none), set by the keyboard hook.
     static HOTKEY: AtomicUsize = AtomicUsize::new(0);
+    /// Currently held mouse-button mask (MK_LBUTTON | MK_RBUTTON | …) so
+    /// forwarded `WM_MOUSEMOVE` wParam tells the app below about drags.
+    static HELD: AtomicU32 = AtomicU32::new(0);
     static STOP: AtomicBool = AtomicBool::new(false);
     /// Raw input events are merged here and flushed to the app at ~1 ms, so
     /// high-rate HID devices (pen / touch / high-polling mice) don't flood
@@ -445,41 +448,98 @@ mod win {
         }
     }
 
+    /// Modifier keys (MK_CONTROL | MK_SHIFT) for forwarded wParam values.
+    fn key_mods() -> usize {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+        let mut m = 0usize;
+        unsafe {
+            if GetKeyState(0x11) < 0 {
+                m |= 0x0008; // MK_CONTROL
+            }
+            if GetKeyState(0x10) < 0 {
+                m |= 0x0004; // MK_SHIFT
+            }
+        }
+        m
+    }
+
     /// Global low-level mouse hook: merges every mouse event (position,
     /// buttons, wheel) into the debounced coalescer, tracks the latest
-    /// global position for the low-latency position fallback, and — when the
-    /// overlay owns the hit-testing — forwards the event to the app below.
+    /// global position, and — when the overlay owns the hit-testing —
+    /// forwards EVERYTHING to the app below so it behaves as if the real
+    /// cursor were there: hover, drags, middle/X buttons, vertical AND
+    /// horizontal wheel, touchpad-generated scroll, etc.
     unsafe extern "system" fn mouse_ll_hook(code: i32, wparam: usize, lparam: isize) -> isize {
         if code >= 0 {
             let m = &*(lparam as *const wam::MSLLHOOKSTRUCT);
             let msg = wparam as u32;
             let (x, y) = (m.pt.x, m.pt.y);
+            let mut held = HELD.load(Ordering::Relaxed);
+            let mods = key_mods();
+            // wParam = held mouse keys | modifier keys (low word).
+            let wp = |h: u32| (h as usize) | mods;
             match msg {
                 wam::WM_MOUSEMOVE => {
                     set_last_pos(x as f64, y as f64);
                     coalesce().mouse_move(x as f64, y as f64);
-                    platform::forward_mouse(x, y, msg, 0);
+                    platform::forward_mouse(x, y, msg, wp(held));
                 }
                 wam::WM_LBUTTONDOWN => {
+                    held |= 0x0001; // MK_LBUTTON
+                    HELD.store(held, Ordering::Relaxed);
                     coalesce().mouse_button(true, false, true);
-                    platform::forward_mouse(x, y, msg, 1); // MK_LBUTTON
+                    platform::forward_mouse(x, y, msg, wp(held));
                 }
                 wam::WM_LBUTTONUP => {
+                    held &= !0x0001;
+                    HELD.store(held, Ordering::Relaxed);
                     coalesce().mouse_button(true, false, false);
-                    platform::forward_mouse(x, y, msg, 0);
+                    platform::forward_mouse(x, y, msg, wp(held));
                 }
                 wam::WM_RBUTTONDOWN => {
+                    held |= 0x0002; // MK_RBUTTON
+                    HELD.store(held, Ordering::Relaxed);
                     coalesce().mouse_button(false, true, true);
-                    platform::forward_mouse(x, y, msg, 2); // MK_RBUTTON
+                    platform::forward_mouse(x, y, msg, wp(held));
                 }
                 wam::WM_RBUTTONUP => {
+                    held &= !0x0002;
+                    HELD.store(held, Ordering::Relaxed);
                     coalesce().mouse_button(false, true, false);
-                    platform::forward_mouse(x, y, msg, 0);
+                    platform::forward_mouse(x, y, msg, wp(held));
                 }
-                wam::WM_MOUSEWHEEL => {
+                wam::WM_MBUTTONDOWN | wam::WM_MBUTTONUP => {
+                    const MK_MBUTTON: u32 = 0x0010;
+                    if msg == wam::WM_MBUTTONDOWN {
+                        held |= MK_MBUTTON;
+                    } else {
+                        held &= !MK_MBUTTON;
+                    }
+                    HELD.store(held, Ordering::Relaxed);
+                    platform::forward_mouse(x, y, msg, wp(held));
+                }
+                wam::WM_XBUTTONDOWN | wam::WM_XBUTTONUP => {
+                    // mouseData high word = 1 (XBUTTON1) or 2 (XBUTTON2).
+                    let btn = ((m.mouseData >> 16) & 0xFFFF) as u32;
+                    let mk = if btn == 1 { 0x0020 } else { 0x0040 }; // MK_XBUTTON1/2
+                    if msg == wam::WM_XBUTTONDOWN {
+                        held |= mk;
+                    } else {
+                        held &= !mk;
+                    }
+                    HELD.store(held, Ordering::Relaxed);
+                    // XBUTTON wParam = (button << 16) | keys.
+                    let w = ((btn as usize) << 16) | wp(held);
+                    platform::forward_mouse(x, y, msg, w);
+                }
+                wam::WM_MOUSEWHEEL | wam::WM_MOUSEHWHEEL => {
                     let delta = (m.mouseData >> 16) as u16 as i16 as i32;
-                    coalesce().wheel(delta);
-                    platform::forward_mouse(x, y, msg, (delta as u16 as usize) << 16);
+                    if msg == wam::WM_MOUSEWHEEL {
+                        coalesce().wheel(delta);
+                    }
+                    // wheel wParam = (delta << 16) | keys.
+                    let w = ((delta as u16 as usize) << 16) | wp(held);
+                    platform::forward_mouse(x, y, msg, w);
                 }
                 _ => {}
             }
