@@ -30,10 +30,14 @@ use std::sync::mpsc::Receiver;
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Contact {
-    /// Tip switch / contact bit.
+    /// Tip switch / contact bit (button byte bit0).
     pub down: bool,
-    /// Pen in range / confidence bit.
+    /// Pen in range bit (button byte bit4).
     pub in_range: bool,
+    /// Barrel / side button (button byte bit1).
+    pub barrel: bool,
+    /// Eraser button (button byte bit2).
+    pub eraser: bool,
     /// Raw X (usually 0..=65535 device units).
     pub x: f64,
     /// Raw Y (usually 0..=65535 device units).
@@ -626,7 +630,9 @@ mod win {
     ///
     /// ```text
     ///   [0]     report ID (1..=255, or 0 if absent)
-    ///   [1]     flags: bit0 contact/tip, bit1 in-range/confidence
+    ///   [1]     button byte:
+    ///             bit0 tip/contact, bit1 barrel (side button),
+    ///             bit2 eraser, bit3 invert, bit4 in-range
     ///   [2..4]  X (16-bit LE)
     ///   [4..6]  Y (16-bit LE)
     ///   [6..8]  pressure (16-bit LE)
@@ -663,7 +669,9 @@ mod win {
         };
         Some(Contact {
             down: flags & 0x01 != 0,
-            in_range: flags & 0x02 != 0,
+            in_range: flags & 0x10 != 0,
+            barrel: flags & 0x02 != 0,
+            eraser: flags & 0x04 != 0,
             x,
             y,
             pressure: pressure.clamp(0.0, 1.0),

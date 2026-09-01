@@ -409,6 +409,7 @@ static GUARD_STARTED: AtomicBool = AtomicBool::new(false);
 static GUARD_STOP: AtomicBool = AtomicBool::new(false);
 static GUARD_FORCE: AtomicUsize = AtomicUsize::new(0);
 static GUARD_HIDE: AtomicBool = AtomicBool::new(false);
+static GUARD_BOOST: AtomicBool = AtomicBool::new(false);
 
 /// Start the high-frequency cursor-guard thread.
 pub fn start_cursor_guard() {
@@ -425,9 +426,12 @@ pub fn start_cursor_guard() {
 /// Update the guard's desired state (called every frame):
 /// * `force` — our `HCURSOR` (as `usize`) to keep showing, or 0.
 /// * `hide`  — keep the OS cursor hidden (e.g. while writing).
-pub fn set_cursor_guard(force: usize, hide: bool) {
+/// * `boost` — run at a higher frequency (right after a pen transition) so
+///   any app/driver that briefly takes the cursor over is beaten back faster.
+pub fn set_cursor_guard(force: usize, hide: bool, boost: bool) {
     GUARD_FORCE.store(force, Ordering::Relaxed);
     GUARD_HIDE.store(hide, Ordering::Relaxed);
+    GUARD_BOOST.store(boost, Ordering::Relaxed);
 }
 
 fn cursor_guard_loop() {
@@ -437,8 +441,12 @@ fn cursor_guard_loop() {
         windows_sys::Win32::Media::timeBeginPeriod(1);
     }
     let period = std::time::Duration::from_millis(1);
+    let boost_period = std::time::Duration::from_micros(200);
     while !GUARD_STOP.load(Ordering::SeqCst) {
-        std::thread::sleep(period);
+        // During a boost window (right after a pen transition) tick much
+        // more often so we win the contention race decisively.
+        let boosted = GUARD_BOOST.load(Ordering::Relaxed);
+        std::thread::sleep(if boosted { boost_period } else { period });
         if GUARD_HIDE.load(Ordering::Relaxed) {
             // Keep the OS cursor hidden (deep counter) even if an app or
             // driver re-shows it in between.
@@ -464,4 +472,5 @@ pub fn stop_cursor_guard() {
     GUARD_STOP.store(true, Ordering::SeqCst);
     GUARD_FORCE.store(0, Ordering::Relaxed);
     GUARD_HIDE.store(false, Ordering::Relaxed);
+    GUARD_BOOST.store(false, Ordering::Relaxed);
 }

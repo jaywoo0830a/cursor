@@ -111,6 +111,9 @@ pub struct CursorOverlayApp {
     /// While the pen is in use (hovering or touching), hide the OS cursor
     /// entirely and paint our circle instead — no competition, no flicker.
     hide_cursor_with_pen: bool,
+    /// How long to keep suppressing the system cursor after a pen-involving
+    /// change (default 3000 ms).
+    pen_hold_ms: u32,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -228,6 +231,7 @@ impl CursorOverlayApp {
             was_pen_active: false,
             pointer_filter: PointerFilter::new(),
             hide_cursor_with_pen: true,
+            pen_hold_ms: 3000,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -541,6 +545,21 @@ impl CursorOverlayApp {
                          instead, so the tablet driver/app cannot take it over\n\
                          or make it flicker — in any pen state.",
                     );
+                #[cfg(target_os = "windows")]
+                ui.horizontal(|ui| {
+                    ui.label("Pen suppression hold:");
+                    ui.add(
+                        egui::Slider::new(&mut self.pen_hold_ms, 500..=5000)
+                            .suffix(" ms")
+                            .logarithmic(true),
+                    )
+                    .on_hover_text(
+                        "How long to keep the system cursor suppressed after\n\
+                         any pen-related change (down/up, side button, device\n\
+                         switch). Longer = fewer pop-outs, at the cost of a\n\
+                         longer painted-circle tail after you switch to mouse.",
+                    );
+                });
                 ui.separator();
 
                 // ---- overlay a specific window (Windows) ----
@@ -614,10 +633,10 @@ impl CursorOverlayApp {
                     let pad = self.raw.touchpad.is_some();
                     ui.monospace(format!(
                         "mouse:  ({:.0}, {:.0})   rawΔ: ({}, {})  wheel: {}\n\
-                         pen:    {}  pressure {:.2}  tilt ({:.0}°, {:.0}°)\n\
+                         pen:    {}  barrel:{} eraser:{}  pressure {:.2}\n\
                          touch:  {}   touchpad: {}\n\
                          device: {}   HID reports: {}\n\
-                         source: {:?}   suppress: {}",
+                         source: {:?}   suppress: {}  hold:{}  boost:{}",
                         self.raw.mouse.0,
                         self.raw.mouse.1,
                         self.raw.raw_delta.0,
@@ -628,15 +647,17 @@ impl CursorOverlayApp {
                             Some(_) => "up    ".to_string(),
                             None => "none  ".to_string(),
                         },
+                        pen.map_or(0, |c| c.barrel as u8),
+                        pen.map_or(0, |c| c.eraser as u8),
                         pen.map_or(0.0, |c| c.pressure),
-                        pen.map_or(0.0, |c| c.tilt_x),
-                        pen.map_or(0.0, |c| c.tilt_y),
                         touch_on,
                         if pad { "active" } else { "none" },
                         self.raw.last_device,
                         self.raw.hid_reports,
                         self.pointer_filter.state(),
                         self.pointer_filter.state().is_pen(),
+                        self.pointer_filter.in_hold(),
+                        self.pointer_filter.in_boost(),
                     ));
                     ui.weak(
                         "Pen / touch / trackpad are captured raw via HID raw input\n\
@@ -697,12 +718,19 @@ impl eframe::App for CursorOverlayApp {
         // (pen down↔up, pen↔mouse, pen↔pad …) — the moments the system cursor
         // tends to pop out.
         let pen_signal = if frame_pen {
-            self.raw
-                .pen
-                .map(|c| PenSignal { down: c.down, in_range: c.in_range })
+            self.raw.pen.map(|c| PenSignal {
+                down: c.down,
+                in_range: c.in_range,
+                barrel: c.barrel,
+                eraser: c.eraser,
+            })
         } else {
             None
         };
+        // Apply the (configurable) suppression-hold duration, then feed the
+        // state machine above. We call set_hold every frame: it is idempotent.
+        self.pointer_filter
+            .set_hold(self.pen_hold_ms.saturating_mul(60) / 1000);
         let pen_suppress = self.pointer_filter.update(pen_signal, frame_mouse, frame_pad);
 
         // ---- keyboard shortcuts ----
@@ -791,7 +819,8 @@ impl eframe::App for CursorOverlayApp {
 
         // High-frequency guard: keep our circle showing (or keep it hidden
         // while the pen is in use) so no other process/driver can take the
-        // cursor over — even between render frames.
+        // cursor over — even between render frames. Right after a pen
+        // transition we ask it to run at boosted frequency.
         #[cfg(target_os = "windows")]
         platform::set_cursor_guard(
             if os_mode && in_region_eff && !pen_active && self.hcursor != 0 {
@@ -800,6 +829,7 @@ impl eframe::App for CursorOverlayApp {
                 0
             },
             pen_active,
+            self.pointer_filter.in_boost(),
         );
 
         if os_mode {
