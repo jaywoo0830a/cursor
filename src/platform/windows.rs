@@ -13,7 +13,7 @@
 //! * click pass-through via `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`)
 //! * forwarding pointer input to the app below (`PostMessage`)
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 /// A Windows window handle (`HWND`).
 pub type HWND = *mut core::ffi::c_void;
@@ -235,6 +235,59 @@ pub fn polish_overlay_window(hwnd: usize) {
             0,
             SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
         );
+    }
+    subclass_overlay_window(hwnd);
+}
+
+// ---------------------------------------------------------------------------
+// Window-proc subclassing — keep our cursor on every WM_SETCURSOR
+// ---------------------------------------------------------------------------
+// The default window proc sets the window *class* cursor (an arrow) whenever
+// WM_SETCURSOR is sent, overriding our per-frame SetCursor. Subclassing lets
+// us own WM_SETCURSOR so our circle can never be replaced.
+
+static PREV_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+/// Cursor handle forced on `WM_SETCURSOR` (0 = let the default proc decide).
+static FORCE_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Force the window to show `hcursor` on every `WM_SETCURSOR` (0 = default).
+pub fn set_force_cursor(hcursor: usize) {
+    FORCE_CURSOR.store(hcursor, Ordering::Relaxed);
+}
+
+unsafe extern "system" fn overlay_wndproc(
+    hwnd: *mut core::ffi::c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CallWindowProcW, SetCursor, WM_SETCURSOR};
+    if msg == WM_SETCURSOR {
+        let force = FORCE_CURSOR.load(Ordering::Relaxed);
+        if force != 0 {
+            SetCursor(force as *mut core::ffi::c_void);
+            return 1; // TRUE: we handled it, default proc won't override
+        }
+    }
+    let prev: windows_sys::Win32::UI::WindowsAndMessaging::WNDPROC =
+        std::mem::transmute(PREV_WNDPROC.load(Ordering::Relaxed));
+    CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+}
+
+/// Replace the overlay window's window-proc so we own `WM_SETCURSOR`.
+fn subclass_overlay_window(hwnd: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+    if PREV_WNDPROC.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    unsafe {
+        let prev = SetWindowLongPtrW(
+            hwnd as *mut core::ffi::c_void,
+            GWLP_WNDPROC,
+            overlay_wndproc as *const () as isize,
+        );
+        PREV_WNDPROC.store(prev, Ordering::Relaxed);
+        log::info!("overlay window subclassed for WM_SETCURSOR");
     }
 }
 

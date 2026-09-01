@@ -71,6 +71,8 @@ pub struct App {
     pub region: RectF,
     pub target_window: Option<String>,
     quit: bool,
+    /// Whether the region has been defaulted to the current window size.
+    region_init: bool,
 
     // --- target-window tracking ---
     target_hwnd: usize,
@@ -123,6 +125,7 @@ impl App {
             },
             target_window,
             quit: false,
+            region_init: false,
             target_hwnd: 0,
             last_target_rect: None,
             window_follow_active: false,
@@ -172,7 +175,11 @@ impl App {
     pub fn set_window_size(&mut self, w: f64, h: f64) {
         self.win_w = w as f32;
         self.win_h = h as f32;
-        if !self.window_follow_active && self.region.w <= 0.0 {
+        // Without a target, default the region to the whole window so the
+        // cursor works across the screen.
+        if !self.window_follow_active && !self.region_init && self.win_w > 0.0 && self.win_h > 0.0
+        {
+            self.region_init = true;
             self.region = RectF {
                 x: 0.0,
                 y: 0.0,
@@ -218,7 +225,7 @@ impl App {
 
         // Global pointer (physical px) -> window-local logical position.
         let (plx, ply) = self.pointer_local();
-        let in_region = self.window_follow_active && self.region.contains(plx, ply);
+        let in_region = self.region.contains(plx, ply);
 
         // 60 ms out-of-region grace (pen/mouse jitter at the boundary).
         if in_region {
@@ -242,12 +249,12 @@ impl App {
             self.update_edit((plx, ply));
         }
 
-        let overlay_on = self.enabled && !self.editing && self.window_follow_active;
+        // The overlay is active even without a target window (whole screen
+        // fallback); if a target is found it just restricts the region.
+        let overlay_on = self.enabled && !self.editing;
         let owning = overlay_on && in_region_eff && !pen_active;
 
-        let passthrough = if !self.window_follow_active {
-            true
-        } else if self.editing {
+        let passthrough = if self.editing {
             false
         } else if pen_active {
             true
@@ -269,14 +276,19 @@ impl App {
         #[cfg(target_os = "windows")]
         platform::set_forwarding(owning, self.native_hwnd);
 
-        // Native cursor (Rust): our circle while owning, an arrow while
-        // editing the region. Otherwise the app below owns the cursor.
+        // Native cursor (Rust): our circle while owning (forced via
+        // WM_SETCURSOR too, so nothing can override it), an arrow while
+        // editing. Otherwise the app below owns the cursor.
         #[cfg(target_os = "windows")]
         {
             if owning {
                 platform::set_cursor_handle(Some(self.hcursor));
+                platform::set_force_cursor(self.hcursor);
             } else if self.editing {
                 platform::set_cursor_handle(None);
+                platform::set_force_cursor(0);
+            } else {
+                platform::set_force_cursor(0);
             }
         }
 
@@ -471,6 +483,7 @@ impl App {
                     self.polish_window();
                     self.window_follow_active = false;
                     self.region_initialized_for_target = false;
+                    self.region_init = false;
                     self.target_hwnd = 0;
                     self.last_target_rect = None;
                     self.win_origin = (0.0, 0.0);
@@ -489,8 +502,7 @@ impl App {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                     self.polish_window();
                     self.window_follow_active = false;
-                    self.region_initialized_for_target = false;
-                    self.last_target_rect = None;
+                    self.region_initialized_for_target = false;                    self.region_init = false;                    self.last_target_rect = None;
                     self.win_origin = (0.0, 0.0);
                 }
                 return;
@@ -501,8 +513,7 @@ impl App {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                     self.polish_window();
                     self.window_follow_active = false;
-                    self.region_initialized_for_target = false;
-                    self.last_target_rect = None;
+                    self.region_initialized_for_target = false;                    self.region_init = false;                    self.last_target_rect = None;
                     self.win_origin = (0.0, 0.0);
                 }
                 return;
@@ -527,6 +538,7 @@ impl App {
                         self.win_h = (b - t) as f32 / scale;
                         if !self.region_initialized_for_target {
                             self.region_initialized_for_target = true;
+                            self.region_init = true;
                             self.region = RectF {
                                 x: 0.0,
                                 y: 0.0,
@@ -544,6 +556,7 @@ impl App {
                         self.polish_window();
                         self.window_follow_active = false;
                         self.region_initialized_for_target = false;
+                        self.region_init = false;
                         self.win_origin = (0.0, 0.0);
                     }
                 }

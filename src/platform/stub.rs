@@ -16,6 +16,8 @@ pub fn create_hcursor_from_rgba(_rgba: &[u8], _w: u16, _h: u16, _x: u16, _y: u16
 
 pub fn set_cursor_handle(_hcursor: Option<usize>) {}
 
+pub fn set_force_cursor(_hcursor: usize) {}
+
 pub fn destroy_cursor(_hcursor: usize) {}
 
 pub fn find_window_by_title(_sub: &str) -> Option<HWND> {
