@@ -9,6 +9,17 @@ import argparse
 CURSOR_STYLES = ("crosshair", "ring", "dot", "ring_cross", "cross_dot")
 
 
+def _parse_rect(text: str):
+    """Parse 'X,Y,W,H' (screen coordinates) into a tuple."""
+    parts = [int(p) for p in text.replace("x", ",").replace("X", ",").split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("expected X,Y,W,H")
+    x, y, w, h = parts
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError("width and height must be positive")
+    return x, y, w, h
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     """Build and parse the command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -80,6 +91,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="Keep the overlay click-through (classic mode). In this mode the "
         "system cursor cannot be hidden over other applications' windows.",
+    )
+    parser.add_argument(
+        "--zone",
+        type=_parse_rect,
+        default=None,
+        metavar="X,Y,W,H",
+        help="Write-zone: only hide the system cursor inside this screen "
+        "rectangle, e.g. --zone 200,200,1200,800. Omit for full-screen mode.",
+    )
+    parser.add_argument(
+        "--edit",
+        action="store_true",
+        help="Start the write zone in edit mode (drag to move, corner to resize)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print received Win32 messages to diagnose cursor hiding",
     )
     args = parser.parse_args(argv)
 
