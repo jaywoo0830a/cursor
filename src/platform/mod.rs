@@ -2,9 +2,9 @@
 //!
 //! On Windows this uses the `windows-sys` crate to call the Win32 API
 //! directly (the low-level half of "Rust for Windows"): global cursor
-//! position / visibility, a real `HCURSOR` built from RGBA pixels, direct
-//! `SetCursor` forcing, system-cursor swapping (`SetSystemCursor`), click
-//! pass-through (`WS_EX_TRANSPARENT`) and target-window tracking.
+//! position (`GetCursorPos`), target-window tracking (`EnumWindows`), click
+//! pass-through (`WS_EX_TRANSPARENT`) and input forwarding to the app below
+//! (`PostMessage`). The cursor itself is rendered by the Chromium frontend.
 
 #[cfg(target_os = "windows")]
 mod windows;

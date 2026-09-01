@@ -1,121 +1,146 @@
-//! # Custom Cursor Overlay (egui 0.36 / eframe 0.36)
+//! # Custom Cursor Overlay (Chromium / WebView2)
 //!
-//! Entry point: pick the rendering backend and start the overlay app.
+//! Ultra-lightweight custom-cursor overlay: a transparent, frameless,
+//! always-on-top window that renders the cursor **in pure CSS** via an
+//! embedded Chromium webview (WebView2 on Windows). The window owns the
+//! hit-testing inside the region, so the app below can never override the
+//! cursor — no pen pop-out, and it works even over DirectComposition/GPU
+//! canvases. All pointer input is forwarded to the app below.
 //!
-//! Behavior:
-//! * Inside a **user-defined region** (a rectangle on the screen) the system
-//!   cursor is replaced by a custom bitmap cursor — *only* the custom cursor
-//!   appears there.
-//! * Outside that region the normal system cursor is shown again.
+//! Stack:
+//! * **Rust core** (`tao` window + `wry` webview): raw input capture
+//!   (WH_MOUSE_LL + WM_INPUT), target-window finding/following, region-based
+//!   click pass-through (`WS_EX_TRANSPARENT`) and input forwarding
+//!   (`PostMessage`).
+//! * **Chromium frontend** (`index.html`, pure CSS/JS, fully offline): the
+//!   custom cursor, the region editor and the settings panel.
 //!
-//! Controls:
-//! * `F1`  – toggle the settings panel
-//! * `Esc` – quit
-//! * While *Edit region* is on, drag the blue box to move it and the white
-//!   handles to resize it.
-//!
-//! On Windows, *Click pass-through* (default on) lets clicks go through the
-//! overlay to the apps below — and it now works together with the OS bitmap
-//! cursor (the system cursor bitmaps are swapped with `SetSystemCursor`, so
-//! the circle is drawn by Windows over any app, including GPU/DirectComposition
-//! canvases like PDF viewers).
+//! Usage: `custom-cursor-overlay --window "<window title substring>"`.
+//! A target window is mandatory — the overlay attaches to it and follows it.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod config;
-mod cursor;
 mod input;
 mod platform;
 
-use eframe::egui::viewport::ViewportBuilder;
+use std::sync::{Arc, Mutex};
 
-/// Pick the rendering backend from `--backend glow|wgpu` (default: glow).
-///
-/// wgpu is eframe's default backend but is known to crash with
-/// `STATUS_ACCESS_VIOLATION` (`0xc0000005`) at startup on some Windows
-/// machines (https://github.com/emilk/egui/issues/3686), so we prefer the
-/// glow (OpenGL) backend. To use wgpu, enable the `wgpu` cargo feature and
-/// pass `--backend wgpu`.
-fn select_renderer() -> eframe::Renderer {
-    let backend = std::env::args()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find(|w| w[0] == "--backend")
-        .map(|w| w[1].to_ascii_lowercase());
+use tao::event::{Event, WindowEvent};
+use tao::event_loop::{ControlFlow, EventLoop};
+use tao::window::{Fullscreen, WindowBuilder};
+use wry::http::{Response, StatusCode};
+use wry::WebViewBuilder;
 
-    match backend.as_deref() {
-        Some("glow") => {
-            #[cfg(feature = "glow")]
-            {
-                return eframe::Renderer::Glow;
-            }
-            #[cfg(not(feature = "glow"))]
-            eprintln!("warning: the glow backend is not compiled; enable the `glow` feature");
-        }
-        Some("wgpu") => {
-            #[cfg(feature = "wgpu")]
-            {
-                return eframe::Renderer::Wgpu;
-            }
-            #[cfg(not(feature = "wgpu"))]
-            eprintln!(
-                "warning: the wgpu backend is not compiled; enable the `wgpu` feature \
-                 (cargo run --features wgpu)"
-            );
-        }
-        Some(other) => {
-            eprintln!("warning: unknown backend {other:?} (expected \"glow\" or \"wgpu\")");
-        }
-        None => {}
-    }
+/// The whole frontend (cursor CSS, region editor, settings UI) is embedded
+/// here so the app runs fully offline with no external files or CDNs.
+const INDEX_HTML: &str = include_str!("../index.html");
 
-    // Default: glow when available, otherwise wgpu.
-    #[cfg(feature = "glow")]
-    {
-        eframe::Renderer::Glow
-    }
-    #[cfg(not(feature = "glow"))]
-    {
-        eframe::Renderer::Wgpu
-    }
-}
-
-fn main() -> eframe::Result {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    let renderer = select_renderer();
-    log::info!("Using the {renderer:?} renderer");
-    #[cfg(target_os = "windows")]
-    eprintln!("custom-cursor-overlay: renderer={renderer:?}, click pass-through supported");
-    #[cfg(not(target_os = "windows"))]
-    eprintln!("custom-cursor-overlay: renderer={renderer:?} (click pass-through is Windows-only)");
-    eprintln!("custom-cursor-overlay: F1 = settings panel, Esc = quit");
-
-    let viewport = ViewportBuilder::default()
-        .with_app_id("custom_cursor_overlay")
-        .with_title("Custom Cursor Overlay")
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_always_on_top()
-        .with_fullscreen(true);
-
-    // The overlay starts with the settings panel closed, so click
-    // pass-through is enabled from the very first frame on Windows.
-    #[cfg(target_os = "windows")]
-    let viewport = viewport.with_mouse_passthrough(true);
-    #[cfg(not(target_os = "windows"))]
-    let viewport = viewport.with_mouse_passthrough(false);
-
-    let native_options = eframe::NativeOptions {
-        renderer,
-        viewport,
-        ..Default::default()
+    // `--window "<title>"` is mandatory: there is no whole-screen mode.
+    let args: Vec<String> = std::env::args().collect();
+    let target = args
+        .windows(2)
+        .find(|w| w[0] == "--window")
+        .map(|w| w[1].clone());
+    let Some(target) = target else {
+        eprintln!("custom-cursor-overlay: error: --window \"<window title substring>\" is required");
+        eprintln!("usage: custom-cursor-overlay --window \"Window Title\"");
+        std::process::exit(1);
     };
+    log::info!("overlaying window matching: {target:?}");
 
-    eframe::run_native(
-        "custom_cursor_overlay",
-        native_options,
-        Box::new(|cc| Ok(Box::new(app::CursorOverlayApp::new(cc)))),
-    )
+    // Transparent, frameless, always-on-top, fullscreen overlay window.
+    let event_loop = EventLoop::new();
+    let window = WindowBuilder::new()
+        .with_title("Custom Cursor Overlay")
+        .with_transparent(true)
+        .with_decorations(false)
+        .with_always_on_top(true)
+        .with_fullscreen(Some(Fullscreen::Borderless(None)))
+        .build(&event_loop)?;
+
+    // Shared app state (main loop + IPC handler).
+    let app_arc = Arc::new(Mutex::new(app::App::new(Some(target))));
+
+    // Grab the native HWND so we can toggle WS_EX_TRANSPARENT directly.
+    {
+        let mut app = app_arc.lock().unwrap();
+        #[cfg(target_os = "windows")]
+        {
+            use tao::platform::windows::WindowExtWindows;
+            app.set_native_hwnd(window.hwnd() as usize);
+        }
+        let scale = window.scale_factor();
+        app.set_scale(scale);
+        let size = window.inner_size();
+        app.set_window_size(size.width as f64 / scale, size.height as f64 / scale);
+    }
+
+    // Embed the Chromium webview (WebView2 on Windows) and serve the offline
+    // frontend over a custom `local://` protocol.
+    let webview = WebViewBuilder::new()
+        .with_transparent(true)
+        .with_url("local://localhost/index.html")
+        .with_custom_protocol("local".into(), |_webview_id, _request| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "text/html; charset=utf-8")
+                .header("Cache-Control", "no-cache")
+                .body(INDEX_HTML.as_bytes().into())
+                .unwrap()
+        })
+        .with_ipc_handler({
+            let app = app_arc.clone();
+            move |request| {
+                let body = request.body().clone();
+                app.lock().unwrap().handle_ipc(&body);
+            }
+        })
+        .build(&window)?;
+
+    log::info!("overlay ready: F1/gear toggles settings, Esc quits (via the frontend)");
+
+    event_loop.run(move |event, _target, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                *control_flow = ControlFlow::ExitWithCode(0);
+            }
+            // Per-frame: drain raw input, run the state machine and push any
+            // state change to the frontend.
+            Event::MainEventsCleared => {
+                let json = {
+                    let mut app = app_arc.lock().unwrap();
+                    app.tick(&window)
+                };
+                if let Some(json) = json {
+                    let _ = webview.evaluate_script(&format!("window.__setState({json})"));
+                }
+                if app_arc.lock().unwrap().should_quit() {
+                    *control_flow = ControlFlow::ExitWithCode(0);
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::ScaleFactorChanged { scale_factor, .. },
+                ..
+            } => {
+                app_arc.lock().unwrap().set_scale(scale_factor);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(size),
+                ..
+            } => {
+                let mut app = app_arc.lock().unwrap();
+                let scale = app.scale();
+                app.set_window_size(size.width as f64 / scale, size.height as f64 / scale);
+            }
+            _ => {}
+        }
+    });
 }

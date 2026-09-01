@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Custom Cursor Overlay</title>
+<style>
+  /* ---- reset: fully transparent, no OS cursor ----
+     The window owns the hit-testing inside the region, so `cursor: none`
+     here means the OS draws *no* cursor for this window; our CSS div is the
+     cursor. Outside the region the window is click-through, so the app below
+     shows its own cursor (our CSS doesn't matter there). */
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    overflow: hidden; background: transparent;
+    user-select: none; -webkit-user-select: none;
+  }
+  * { cursor: none !important; }
+
+  /* ---- custom CSS cursor (radial-gradient ring + soft shadow + dot) ---- */
+  #cur {
+    position: fixed; left: 0; top: 0; z-index: 999999;
+    width: 22px; height: 22px;
+    pointer-events: none; display: none;
+    transform: translate(-50%, -50%);
+    will-change: left, top;
+  }
+  #cur .ring {
+    position: absolute; inset: 0; border-radius: 50%;
+    background: radial-gradient(circle,
+      rgba(255,255,255,0.98) 0%,
+      rgba(255,255,255,0.55) 48%,
+      rgba(120,200,255,0.25) 70%,
+      rgba(120,200,255,0) 100%);
+    box-shadow:
+      0 0 6px rgba(0,0,0,0.45),
+      0 0 14px rgba(0,0,0,0.18);
+  }
+  #cur .dot {
+    position: absolute; left: 50%; top: 50%;
+    width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px;
+    border-radius: 50%;
+    background: #111;
+    box-shadow: 0 0 2px rgba(255,255,255,0.9);
+  }
+
+  /* ---- region outline + resize handles ---- */
+  #region {
+    position: fixed; z-index: 10;
+    border: 2px dashed rgba(0,150,255,0.85);
+    background: rgba(0,150,255,0.06);
+    pointer-events: none;  /* clicks pass to the app below unless editing */
+    display: none;
+  }
+  #region.editing { pointer-events: auto; cursor: move; }
+  .rh {
+    position: absolute; width: 12px; height: 12px;
+    background: #fff; border: 1.5px solid #0096ff;
+    border-radius: 3px; box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+    display: none; box-sizing: border-box;
+  }
+  #region.editing .rh { display: block; }
+  .rh.nw { left: -7px;  top: -7px;  cursor: nwse-resize; }
+  .rh.n  { left: 50%;  top: -7px;  transform: translateX(-50%); cursor: ns-resize; }
+  .rh.ne { right: -7px; top: -7px;  cursor: nesw-resize; }
+  .rh.e  { right: -7px; top: 50%;   transform: translateY(-50%); cursor: ew-resize; }
+  .rh.se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+  .rh.s  { left: 50%;  bottom: -7px; transform: translateX(-50%); cursor: ns-resize; }
+  .rh.sw { left: -7px; bottom: -7px; cursor: nesw-resize; }
+  .rh.w  { left: -7px; top: 50%;   transform: translateY(-50%); cursor: ew-resize; }
+
+  /* ---- status bar (click the gear to open settings) ---- */
+  #status {
+    position: fixed; left: 10px; top: 8px; z-index: 100;
+    display: flex; align-items: center; gap: 8px;
+    font: 11px/1.4 "Segoe UI", system-ui, sans-serif;
+    color: rgba(230,230,230,0.85);
+    background: rgba(20,20,30,0.55);
+    padding: 4px 8px; border-radius: 6px;
+    -webkit-backdrop-filter: blur(2px);
+    pointer-events: auto;
+  }
+  #gear {
+    border: none; background: rgba(255,255,255,0.15);
+    color: #eee; font-size: 13px; line-height: 1;
+    border-radius: 4px; padding: 2px 6px; cursor: pointer;
+  }
+  #gear:hover { background: rgba(255,255,255,0.3); }
+
+  /* ---- settings panel ---- */
+  #panel {
+    position: fixed; left: 10px; top: 40px; z-index: 200;
+    width: 320px; box-sizing: border-box;
+    font: 13px/1.5 "Segoe UI", system-ui, sans-serif;
+    color: #ddd;
+    background: rgba(24,26,36,0.92);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 10px;
+    padding: 12px 14px;
+    -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+    display: none; pointer-events: auto;
+  }
+  #panel.visible { display: block; }
+  #panel h1 { font-size: 13px; margin: 0 0 8px; color: #fff; font-weight: 600; }
+  #panel label { display: flex; align-items: center; gap: 8px; margin: 5px 0; cursor: pointer; }
+  #panel input[type=checkbox] { width: 14px; height: 14px; accent-color: #0096ff; }
+  #panel .row { display: flex; gap: 6px; margin: 8px 0; }
+  #panel input[type=text] {
+    flex: 1; min-width: 0; background: rgba(255,255,255,0.08);
+    border: 1px solid rgba(255,255,255,0.2); border-radius: 5px;
+    color: #eee; padding: 4px 6px; font-size: 12px; outline: none;
+  }
+  #panel input[type=text]:focus { border-color: #0096ff; }
+  #panel button {
+    background: rgba(0,150,255,0.25); border: 1px solid rgba(0,150,255,0.6);
+    color: #fff; border-radius: 5px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+  }
+  #panel button:hover { background: rgba(0,150,255,0.4); }
+  #panel .sec { font-size: 11px; color: rgba(255,255,255,0.5); margin: 10px 0 4px; }
+  #panel .hint { font-size: 11px; color: rgba(255,255,255,0.45); margin-top: 8px; }
+  #quit { background: rgba(220,60,60,0.3); border-color: rgba(220,80,80,0.7); }
+  #quit:hover { background: rgba(220,60,60,0.5); }
+</style>
+</head>
+<body>
+
+  <!-- custom CSS cursor -->
+  <div id="cur"><div class="ring"></div><div class="dot"></div></div>
+
+  <!-- overlay region (outline + resize handles) -->
+  <div id="region">
+    <div class="rh nw" data-dir="nw"></div>
+    <div class="rh n"  data-dir="n"></div>
+    <div class="rh ne" data-dir="ne"></div>
+    <div class="rh e"  data-dir="e"></div>
+    <div class="rh se" data-dir="se"></div>
+    <div class="rh s"  data-dir="s"></div>
+    <div class="rh sw" data-dir="sw"></div>
+    <div class="rh w"  data-dir="w"></div>
+  </div>
+
+  <!-- status bar -->
+  <div id="status" class="ui-block">
+    <span id="statusText">overlay…</span>
+    <button id="gear" title="설정 (F1)">⚙</button>
+  </div>
+
+  <!-- settings panel -->
+  <div id="panel" class="ui-block">
+    <h1>Custom Cursor Overlay</h1>
+    <label><input type="checkbox" id="ckEnable"> Enable custom cursor</label>
+    <label><input type="checkbox" id="ckEdit"> Edit region (drag / resize)</label>
+    <label><input type="checkbox" id="ckShow"> Show region outline</label>
+
+    <div class="sec">대상 창 (필수: --window)</div>
+    <div class="row">
+      <input type="text" id="targetInput" placeholder="window title substring">
+      <button id="btnApply">적용</button>
+      <button id="btnClear">해제</button>
+    </div>
+
+    <div class="sec">영역 프리셋</div>
+    <div class="row">
+      <button data-preset="fullscreen">전체</button>
+      <button data-preset="center">중앙</button>
+      <button data-preset="reset">초기화</button>
+    </div>
+
+    <div class="hint" id="statusDetail"></div>
+    <div class="row"><button id="quit">종료 (Esc)</button></div>
+  </div>
+
+<script>
+"use strict";
+
+// ---- state (mirror of the Rust side) ----
+let state = {
+  enabled: true, editing: false, show_region: false, settings: false,
+  owning: false, passthrough: true, in_region: false, found: false,
+  target: "", device: "mouse",
+  region: { x: 0, y: 0, w: 0, h: 0 },
+  win: { w: 0, h: 0 },
+};
+const MIN = 24;
+const cur = document.getElementById("cur");
+const regionEl = document.getElementById("region");
+const statusText = document.getElementById("statusText");
+const statusDetail = document.getElementById("statusDetail");
+const panel = document.getElementById("panel");
+
+// ---- IPC to Rust ----
+function send(msg) {
+  try { window.ipc.postMessage(JSON.stringify(msg)); } catch (e) { /* not ready */ }
+}
+window.__setState = function (s) {
+  state = s; render();
+};
+
+// ---- custom cursor follows the pointer (native events — we own them
+//      inside the region / while editing) ----
+let pointer = { x: -100, y: -100 };
+function onPointer(e) {
+  pointer.x = e.clientX; pointer.y = e.clientY;
+  positionCursor();
+}
+window.addEventListener("pointermove", onPointer, { passive: true });
+window.addEventListener("mousemove", onPointer, { passive: true });
+
+function positionCursor() {
+  cur.style.left = pointer.x + "px";
+  cur.style.top = pointer.y + "px";
+}
+function renderCursor() {
+  const show = state.owning || state.editing || state.settings;
+  cur.style.display = show ? "block" : "none";
+  positionCursor();
+}
+
+// ---- region editor ----
+let drag = null; // { mode, dir, sx, sy, x, y, w, h }
+const handles = document.querySelectorAll(".rh");
+
+regionEl.addEventListener("pointerdown", (e) => {
+  if (!state.editing) return;
+  e.preventDefault();
+  beginDrag(e, "move", "");
+});
+handles.forEach((h) => {
+  h.addEventListener("pointerdown", (e) => {
+    if (!state.editing) return;
+    e.preventDefault(); e.stopPropagation();
+    beginDrag(e, "resize", h.dataset.dir);
+  });
+});
+
+function beginDrag(e, mode, dir) {
+  drag = { mode, dir, sx: e.clientX, sy: e.clientY,
+           x: state.region.x, y: state.region.y,
+           w: state.region.w, h: state.region.h };
+  document.addEventListener("pointermove", onDragMove);
+  document.addEventListener("pointerup", onDragEnd);
+}
+function onDragMove(e) {
+  if (!drag) return;
+  const dx = e.clientX - drag.sx, dy = e.clientY - drag.sy;
+  let { x, y, w, h } = drag;
+  if (drag.mode === "move") {
+    x = clamp(drag.x + dx, 0, Math.max(0, state.win.w - w));
+    y = clamp(drag.y + dy, 0, Math.max(0, state.win.h - h));
+  } else {
+    const d = drag.dir;
+    if (d.includes("e")) w = Math.max(MIN, drag.w + dx);
+    if (d.includes("s")) h = Math.max(MIN, drag.h + dy);
+    if (d.includes("w")) {
+      w = drag.w - dx;
+      if (w >= MIN) { x = drag.x + dx; } else { w = MIN; x = drag.x + drag.w - MIN; }
+    }
+    if (d.includes("n")) {
+      h = drag.h - dy;
+      if (h >= MIN) { y = drag.y + dy; } else { h = MIN; y = drag.y + drag.h - MIN; }
+    }
+    x = clamp(x, 0, Math.max(0, state.win.w - MIN));
+    y = clamp(y, 0, Math.max(0, state.win.h - MIN));
+  }
+  state.region = { x, y, w, h };
+  renderRegion();
+  scheduleRegionSend();
+}
+function onDragEnd() {
+  document.removeEventListener("pointermove", onDragMove);
+  document.removeEventListener("pointerup", onDragEnd);
+  if (drag) scheduleRegionSend(true);
+  drag = null;
+}
+function clamp(v, a, b) { return Math.min(Math.max(v, a), b); }
+let pendingRegion = false;
+function scheduleRegionSend(immediate) {
+  const sendNow = () => send({
+    cmd: "set_region", x: state.region.x, y: state.region.y,
+    w: state.region.w, h: state.region.h,
+  });
+  if (immediate) { sendNow(); pendingRegion = false; return; }
+  if (!pendingRegion) {
+    pendingRegion = true;
+    requestAnimationFrame(() => { pendingRegion = false; sendNow(); });
+  }
+}
+
+// ---- render ----
+function renderRegion() {
+  const show = state.show_region || state.editing;
+  regionEl.style.display = show ? "block" : "none";
+  if (!show) return;
+  regionEl.style.left = state.region.x + "px";
+  regionEl.style.top = state.region.y + "px";
+  regionEl.style.width = state.region.w + "px";
+  regionEl.style.height = state.region.h + "px";
+  regionEl.classList.toggle("editing", state.editing);
+}
+
+function renderStatus() {
+  const t = state.target || "(none)";
+  statusText.textContent =
+    "🎯 " + t +
+    " · " + (state.found ? "찾음" : "찾는 중") +
+    " · 영역:" + (state.in_region ? "IN" : "OUT") +
+    " · 소유:" + (state.owning ? "ON" : "OFF") +
+    " · in:" + state.device;
+  statusDetail.textContent =
+    "owning=" + state.owning +
+    " · passthrough=" + state.passthrough +
+    " · region=" + JSON.stringify(state.region) +
+    " · win=" + state.win.w + "x" + state.win.h;
+}
+
+function renderPanel() {
+  panel.classList.toggle("visible", state.settings);
+  document.getElementById("ckEnable").checked = state.enabled;
+  document.getElementById("ckEdit").checked = state.editing;
+  document.getElementById("ckShow").checked = state.show_region;
+  if (!state.found) {
+    // don't clobber what the user is typing
+  }
+}
+
+function reportUiRects() {
+  const rects = [];
+  document.querySelectorAll(".ui-block").forEach((el) => {
+    if (el.style.display === "none") return;
+    const r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) {
+      rects.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+    }
+  });
+  send({ cmd: "set_ui_rects", rects });
+}
+
+function render() {
+  renderCursor();
+  renderRegion();
+  renderStatus();
+  renderPanel();
+  reportUiRects();
+}
+
+// ---- settings controls ----
+document.getElementById("ckEnable").addEventListener("change", (e) =>
+  send({ cmd: "set_enabled", value: e.target.checked }));
+document.getElementById("ckEdit").addEventListener("change", (e) =>
+  send({ cmd: "set_editing", value: e.target.checked }));
+document.getElementById("ckShow").addEventListener("change", (e) =>
+  send({ cmd: "set_show_region", value: e.target.checked }));
+document.getElementById("gear").addEventListener("click", () =>
+  send({ cmd: "settings", value: !state.settings }));
+document.querySelectorAll("[data-preset]").forEach((b) =>
+  b.addEventListener("click", () => send({ cmd: "preset", name: b.dataset.preset })));
+document.getElementById("btnApply").addEventListener("click", () =>
+  send({ cmd: "set_target", title: document.getElementById("targetInput").value }));
+document.getElementById("btnClear").addEventListener("click", () => {
+  document.getElementById("targetInput").value = "";
+  send({ cmd: "set_target", title: "" });
+});
+document.getElementById("quit").addEventListener("click", () => send({ cmd: "quit" }));
+
+// keys: F1 = settings, Esc = quit (works when this window has focus)
+window.addEventListener("keydown", (e) => {
+  if (e.key === "F1") { e.preventDefault(); send({ cmd: "settings", value: !state.settings }); }
+  else if (e.key === "Escape") { send({ cmd: "quit" }); }
+});
+
+// no right-click menu on the overlay
+window.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// re-report UI rects when the window is resized (the overlay follows the target)
+window.addEventListener("resize", () => { reportUiRects(); });
+
+// tell Rust we are ready so it pushes the current state
+send({ cmd: "ready" });
+render();
+</script>
+</body>
+</html>

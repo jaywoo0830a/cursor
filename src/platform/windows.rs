@@ -1,17 +1,15 @@
 //! Windows implementation of the platform layer: raw Win32 API via
 //! `windows-sys`.
 //!
-//! Provides:
-//! * global cursor position / visibility (`GetCursorPos`, `ShowCursor`)
-//! * a real `HCURSOR` built from RGBA pixels (`CreateDIBSection` +
-//!   `CreateIconIndirect`) and direct `SetCursor` forcing
-//! * swapping the *system* cursor bitmaps (`SetSystemCursor`) so the custom
-//!   circle shows over any app **and** click pass-through can stay on
-//! * click pass-through via `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`)
+//! The cursor itself is rendered by the Chromium webview (pure CSS), so this
+//! layer only provides the native plumbing:
+//! * global cursor position (`GetCursorPos`)
 //! * target-window tracking (`EnumWindows`, `GetWindowRect`)
+//! * click pass-through via `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`)
+//! * forwarding pointer input to the app below (`PostMessage`)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 /// A Windows window handle (`HWND`).
 pub type HWND = *mut core::ffi::c_void;
@@ -31,118 +29,10 @@ pub fn global_cursor_pos() -> Option<(f64, f64)> {
     }
 }
 
-/// Hide (`false`) / show (`true`) the system cursor. `ShowCursor` uses a
-/// global display counter, so we force it into the desired state (other
-/// windows may re-increment the counter).
-pub fn set_system_cursor_visible(visible: bool) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor;
-    unsafe {
-        if visible {
-            // Force the counter back up so the cursor is visible again.
-            while ShowCursor(1) < 0 {}
-        } else {
-            // Push the counter well below 0: a handful of ShowCursor(TRUE)
-            // calls by apps (e.g. Windows Ink / OTD while the pen moves)
-            // between our frames cannot re-show the cursor.
-            for _ in 0..10 {
-                ShowCursor(0);
-            }
-            while ShowCursor(0) >= 0 {}
-        }
-    }
-}
-
-/// Create a real `HCURSOR` from straight RGBA pixels (32bpp ARGB DIB +
-/// empty mask). Returns the handle as `usize`, or 0 on failure.
-pub fn create_hcursor_from_rgba(rgba: &[u8], w: u16, h: u16, hot_x: u16, hot_y: u16) -> usize {
-    use std::mem::{size_of, zeroed};
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        DIB_RGB_COLORS,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
-
-    unsafe {
-        let (w, h) = (w as u32, h as u32);
-        let mut bmi: BITMAPINFO = zeroed();
-        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
-        bmi.bmiHeader.biWidth = w as i32;
-        bmi.bmiHeader.biHeight = -(h as i32); // top-down
-        bmi.bmiHeader.biPlanes = 1;
-        bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB;
-
-        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-        let hbm_color = CreateDIBSection(
-            std::ptr::null_mut(),
-            &bmi,
-            DIB_RGB_COLORS,
-            &mut bits,
-            std::ptr::null_mut(),
-            0,
-        );
-        if hbm_color.is_null() || bits.is_null() {
-            return 0;
-        }
-
-        // Copy as premultiplied BGRA (Windows' ARGB cursor format).
-        let n = w as usize * h as usize;
-        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, n * 4);
-        for (i, px) in rgba.chunks_exact(4).take(n).enumerate() {
-            let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
-            dst[i * 4 + 0] = (b * a / 255) as u8;
-            dst[i * 4 + 1] = (g * a / 255) as u8;
-            dst[i * 4 + 2] = (r * a / 255) as u8;
-            dst[i * 4 + 3] = a as u8;
-        }
-
-        // 1bpp mask, all zeros (alpha comes from the color DIB).
-        let mask_row_bytes = ((w + 31) / 32) * 4;
-        let mask = vec![0u8; (mask_row_bytes as usize) * h as usize];
-        let hbm_mask = CreateBitmap(w as i32, h as i32, 1, 1, mask.as_ptr().cast());
-        if hbm_mask.is_null() {
-            DeleteObject(hbm_color);
-            return 0;
-        }
-
-        let info = ICONINFO {
-            fIcon: 0, // cursor, not icon
-            xHotspot: hot_x as u32,
-            yHotspot: hot_y as u32,
-            hbmMask: hbm_mask,
-            hbmColor: hbm_color,
-        };
-        let hcursor = CreateIconIndirect(&info);
-        DeleteObject(hbm_color);
-        DeleteObject(hbm_mask);
-        hcursor as usize
-    }
-}
-
-/// Set the system cursor to our custom handle (`Some`) or the default
-/// arrow (`None`). Re-asserting this every frame overrides any cursor an
-/// app (e.g. a PDF viewer's canvas) sets in between.
-pub fn set_cursor_handle(hcursor: Option<usize>) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_ARROW};
-    unsafe {
-        let h = match hcursor {
-            Some(h) if h != 0 => h as *mut core::ffi::c_void,
-            _ => LoadCursorW(std::ptr::null_mut(), IDC_ARROW) as *mut core::ffi::c_void,
-        };
-        SetCursor(h);
-    }
-}
-
-/// Destroy a cursor created with [`create_hcursor_from_rgba`].
-pub fn destroy_cursor(hcursor: usize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::DestroyCursor;
-    if hcursor != 0 {
-        unsafe {
-            DestroyCursor(hcursor as *mut core::ffi::c_void);
-        }
-    }
-}
-
+// Cursor rendering moved to the Chromium frontend (pure CSS: the window owns
+// the hit-testing inside the region, so the OS draws the CSS cursor for this
+// window and apps below can never override it — no pen pop-out, works over
+// DirectComposition). No ShowCursor / SetCursor / SetSystemCursor needed.
 /// Find a visible, non-minimized top-level window whose title contains
 /// `sub` (case-insensitive). Returns its `HWND`, or `None`.
 pub fn find_window_by_title(sub: &str) -> Option<HWND> {
@@ -224,212 +114,7 @@ pub fn apply_passthrough(hwnd: usize, passthrough: bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// System-cursor swapping — bitmap cursor + click pass-through together
-// ---------------------------------------------------------------------------
-
-/// The system-cursor IDs we replace while the pointer is inside the region,
-/// so every standard cursor state (arrow, I-beam while typing, hand while
-/// hovering, busy, no-drop, resize arrows, …) shows our circle instead.
-fn ocr_ids() -> &'static [u32] {
-    use windows_sys::Win32::UI::WindowsAndMessaging as w;
-    &[
-        w::OCR_NORMAL,     // arrow
-        w::OCR_IBEAM,      // text / typing
-        w::OCR_WAIT,       // busy
-        w::OCR_CROSS,      // precision select
-        w::OCR_UP,         // up arrow
-        w::OCR_SIZE,       // legacy size
-        w::OCR_ICON,       // legacy icon
-        w::OCR_ICOCUR,     // icon + cursor
-        w::OCR_SIZEALL,    // move
-        w::OCR_SIZENWSE,
-        w::OCR_SIZENESW,
-        w::OCR_SIZEWE,
-        w::OCR_SIZENS,
-        w::OCR_NO,         // no-drop
-        w::OCR_HAND,       // hand / link hover
-        w::OCR_HELP,       // help
-        w::OCR_APPSTARTING,
-    ]
-}
-
-struct SystemCursorState {
-    /// (system cursor id, original cursor copy) — one per successfully saved id.
-    saved: Vec<(u32, usize)>,
-    /// Our custom cursor (owned by the app; we only ever pass copies of it).
-    custom: usize,
-    /// Whether the system cursors currently show our bitmap.
-    active: bool,
-}
-
-static SYS_CURSOR: OnceLock<Mutex<Option<SystemCursorState>>> = OnceLock::new();
-
-fn sys_cursor() -> &'static Mutex<Option<SystemCursorState>> {
-    SYS_CURSOR.get_or_init(|| Mutex::new(None))
-}
-
-/// Save copies of every system cursor we may want to replace and remember our
-/// custom cursor. Returns whether the swap is available.
-pub fn init_system_cursor_swap(custom: usize) -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CopyIcon, LoadCursorW};
-    if custom == 0 {
-        return false;
-    }
-    let mut guard = sys_cursor().lock().unwrap();
-    if guard.is_some() {
-        return true;
-    }
-    let mut saved = Vec::new();
-    unsafe {
-        for &id in ocr_ids() {
-            // OCR_* are numeric resource ids; pass them via MAKEINTRESOURCE.
-            let orig = LoadCursorW(std::ptr::null_mut(), id as usize as *const u16);
-            if orig.is_null() {
-                continue;
-            }
-            let copy = CopyIcon(orig);
-            if !copy.is_null() {
-                saved.push((id, copy as usize));
-            }
-        }
-    }
-    if saved.is_empty() {
-        return false;
-    }
-    *guard = Some(SystemCursorState {
-        saved,
-        custom,
-        active: false,
-    });
-    true
-}
-
-/// Show our cursor bitmap (`active`) or restore the originals (`!active`) for
-/// all system-cursor IDs. Only swaps on state transitions, and only when the
-/// swap was initialized successfully.
-pub fn set_system_cursor_active(active: bool, custom: usize) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CopyIcon, SetSystemCursor};
-    let mut guard = sys_cursor().lock().unwrap();
-    if guard.is_none() {
-        drop(guard);
-        if !init_system_cursor_swap(custom) {
-            return;
-        }
-        guard = sys_cursor().lock().unwrap();
-    }
-    let Some(state) = guard.as_mut() else {
-        return;
-    };
-    if state.active == active {
-        return;
-    }
-    unsafe {
-        for (id, saved) in &state.saved {
-            let src = if active { state.custom } else { *saved };
-            if src == 0 {
-                continue;
-            }
-            // SetSystemCursor destroys the cursor you pass, so hand it a copy.
-            let copy = CopyIcon(src as *mut core::ffi::c_void);
-            if !copy.is_null() {
-                SetSystemCursor(copy, *id);
-            }
-        }
-    }
-    state.active = active;
-}
-
-/// Restore all system cursors (from the registry) and free our saved copies.
-/// Called on shutdown.
-pub fn restore_system_cursor_swap() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CopyIcon, DestroyIcon, SetSystemCursor, SystemParametersInfoW, SPI_SETCURSORS,
-        SPIF_SENDCHANGE,
-    };
-    let mut guard = sys_cursor().lock().unwrap();
-    if let Some(state) = guard.take() {
-        if state.active {
-            unsafe {
-                for (id, saved) in &state.saved {
-                    let copy = CopyIcon(*saved as *mut core::ffi::c_void);
-                    if !copy.is_null() {
-                        SetSystemCursor(copy, *id);
-                    }
-                }
-            }
-        }
-        unsafe {
-            // Reload every system cursor from the registry.
-            SystemParametersInfoW(SPI_SETCURSORS, 0, std::ptr::null_mut(), SPIF_SENDCHANGE);
-            for (_, h) in &state.saved {
-                if *h != 0 {
-                    DestroyIcon(*h as *mut core::ffi::c_void);
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// High-frequency cursor guard — "no takeover" (best effort)
-// ---------------------------------------------------------------------------
-// The cursor is a shared global resource: any process can call SetCursor /
-// SetSystemCursor, so in userspace we cannot *prevent* the call itself.
-// What we CAN do is make any takeover last only a few milliseconds by
-// continuously re-asserting our circle from a dedicated high-frequency
-// thread (1 ms timer resolution via timeBeginPeriod), independent of the
-// ~60 Hz render loop.
-
-static GUARD_STARTED: AtomicBool = AtomicBool::new(false);
-static GUARD_STOP: AtomicBool = AtomicBool::new(false);
-static GUARD_HIDE: AtomicBool = AtomicBool::new(false);
-
-/// Start the high-frequency cursor-guard thread.
-pub fn start_cursor_guard() {
-    if GUARD_STARTED.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    GUARD_STOP.store(false, Ordering::SeqCst);
-    std::thread::Builder::new()
-        .name("cursor-guard".into())
-        .spawn(cursor_guard_loop)
-        .ok();
-}
-
-/// Update the guard's desired state (called every frame): keep the OS cursor
-/// fully hidden (`hide` = true) or idle (`hide` = false). It continuously
-/// re-hides it so no app/driver can show it in between frames.
-pub fn set_cursor_guard(hide: bool) {
-    GUARD_HIDE.store(hide, Ordering::Relaxed);
-}
-
-fn cursor_guard_loop() {
-    unsafe {
-        // 1 ms timer resolution so the guard actually ticks at ~1–4 ms
-        // (Windows default sleep granularity is ~15.6 ms).
-        windows_sys::Win32::Media::timeBeginPeriod(1);
-    }
-    let period = std::time::Duration::from_millis(1);
-    while !GUARD_STOP.load(Ordering::SeqCst) {
-        std::thread::sleep(period);
-        if GUARD_HIDE.load(Ordering::Relaxed) {
-            // Keep the OS cursor hidden (deep counter) even if an app or
-            // driver re-shows it in between.
-            set_system_cursor_visible(false);
-        }
-    }
-    unsafe {
-        windows_sys::Win32::Media::timeEndPeriod(1);
-    }
-}
-
-/// Stop the cursor guard (called on shutdown).
-pub fn stop_cursor_guard() {
-    GUARD_STOP.store(true, Ordering::SeqCst);
-    GUARD_HIDE.store(false, Ordering::Relaxed);
-}
-
+// (system-cursor swapping removed — the Chromium frontend owns the cursor)
 // ---------------------------------------------------------------------------
 // Input forwarding — cursor-owning mode
 // ---------------------------------------------------------------------------
@@ -441,6 +126,10 @@ pub fn stop_cursor_guard() {
 
 static FORWARD_ON: AtomicBool = AtomicBool::new(false);
 static FORWARD_HWND: AtomicUsize = AtomicUsize::new(0);
+/// Rectangles (physical screen px) where forwarded clicks are swallowed —
+/// i.e. the frontend's own UI (status bar, settings panel). Points inside
+/// are not replayed to the app below, so clicking our UI doesn't double-fire.
+static FORWARD_BLOCK: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
 
 /// Enable/disable forwarding of pointer input to the window below our
 /// overlay. `our_hwnd` is the overlay window (excluded from the target
@@ -448,6 +137,12 @@ static FORWARD_HWND: AtomicUsize = AtomicUsize::new(0);
 pub fn set_forwarding(enabled: bool, our_hwnd: usize) {
     FORWARD_ON.store(enabled, Ordering::Relaxed);
     FORWARD_HWND.store(our_hwnd, Ordering::Relaxed);
+}
+
+/// Set the frontend-UI rectangles (physical screen px) that must not be
+/// replayed to the app below.
+pub fn set_forward_block_rects(rects: &[(i32, i32, i32, i32)]) {
+    *FORWARD_BLOCK.lock().unwrap() = rects.to_vec();
 }
 
 /// Topmost visible top-level window (excluding `exclude`) whose rect contains
@@ -487,6 +182,16 @@ pub fn forward_mouse(pt_x: i32, pt_y: i32, msg: u32, wparam: usize) {
     };
     if !FORWARD_ON.load(Ordering::Relaxed) {
         return;
+    }
+    // Don't replay clicks that landed on our own frontend UI.
+    {
+        let block = FORWARD_BLOCK.lock().unwrap();
+        if block
+            .iter()
+            .any(|&(x1, y1, x2, y2)| pt_x >= x1 && pt_x < x2 && pt_y >= y1 && pt_y < y2)
+        {
+            return;
+        }
     }
     let exclude = FORWARD_HWND.load(Ordering::Relaxed);
     unsafe {
