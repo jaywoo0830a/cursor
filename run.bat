@@ -14,5 +14,7 @@ echo Installing dependencies...
 python -m pip install -r requirements.txt
 
 echo Starting overlay...
-python main.py --style ring_cross --size 40 --color "#FF2D55" --hide-system-cursor
+REM The overlay hides the system + pen cursors and shows only the custom one.
+REM 200 Hz is the default refresh rate for high-refresh monitors.
+python main.py --style ring_cross --size 40 --color "#FF2D55"
 pause

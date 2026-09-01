@@ -6,6 +6,7 @@ Examples:
     python main.py --monitor 0 --fps 120
 """
 
+import ctypes
 import sys
 
 from PySide6.QtWidgets import QApplication
@@ -22,6 +23,11 @@ def main() -> int:
     # the last window.
     app.setQuitOnLastWindowClosed(False)
 
+    # Raise the Windows timer resolution to 1 ms so the high-FPS poll timer
+    # (200 Hz by default) is not clamped to the default ~15.6 ms.
+    winmm = ctypes.windll.winmm
+    winmm.timeBeginPeriod(1)
+
     overlay = CursorOverlay(settings)
     overlay.show()
     overlay.finalize()  # Win32 click-through styles + global hotkey
@@ -32,6 +38,11 @@ def main() -> int:
         # Always restore the system / pen cursor when the app exits (including
         # Ctrl+C in the console).
         overlay.restore_system_cursor()
+        winmm.timeEndPeriod(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 
 if __name__ == "__main__":

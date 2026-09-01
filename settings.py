@@ -47,8 +47,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument(
         "--fps",
         type=int,
-        default=60,
-        help="Overlay refresh rate (frames per second)",
+        default=200,
+        help="Overlay refresh rate in frames per second (200 = smooth on "
+        "high-refresh monitors)",
     )
     parser.add_argument(
         "--monitor",
@@ -58,13 +59,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--hide-system-cursor",
-        action="store_true",
-        help="Hide the native Windows cursor while the overlay runs (default)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Hide the native Windows cursor (mouse + pen) while the overlay "
+        "runs. Use --no-hide-system-cursor to keep it visible.",
     )
     parser.add_argument(
         "--show-system-cursor",
         action="store_true",
-        help="Keep the native Windows cursor visible under the overlay",
+        help=argparse.SUPPRESS,  # legacy alias for --no-hide-system-cursor
     )
     parser.add_argument(
         "--no-hide-pen-cursor",

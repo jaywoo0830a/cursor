@@ -22,6 +22,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
+기본적으로 **시스템 커서(마우스 + 펜)를 모두 숨기고** 200Hz로 갱신하며,
+우리 커스텀 커서만 보이게 됩니다. `Ctrl + Shift + H`로 잠시 보이게 할 수 있습니다.
+
 ## 사용법 / 옵션
 
 | 옵션 | 기본값 | 설명 |
@@ -31,10 +34,10 @@ python main.py
 | `--color` | `#FF2D55` | 커서 색상 (hex) |
 | `--gap` | `0.35` | 십자 커서의 가운데 빈 간격(반지름 대비 비율) |
 | `--thickness` | `2` | 선 두께(px) |
-| `--fps` | `60` | 갱신 속도 |
+| `--fps` | `200` | 갱신 속도 (200 = 고주사율 모니터 기준, 타이머 해상도 1ms 적용) |
 | `--monitor` | `-1` | 표시할 모니터 인덱스(0부터), `-1`이면 전체 모니터 |
-| `--hide-system-cursor` | 기본 | 시스템 커서 숨김 (마우스 + 펜) |
-| `--show-system-cursor` | - | 시스템 커서 유지 (오버레이 위에 겹쳐 표시) |
+| `--hide-system-cursor` / `--no-hide-system-cursor` | 기본 켜짐 | 시스템 커서(마우스+펜) 숨기기 / 끄기 |
+| `--show-system-cursor` | - | 시스템 커서 유지 (구버전 옵션, `--no-hide-system-cursor`와 동일) |
 | `--no-hide-pen-cursor` | - | Windows Ink 펜 커서를 끄지 않음 (레지스트리 변경 안 함) |
 
 예시:
