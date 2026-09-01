@@ -1,12 +1,12 @@
-//! Core application state — **all logic lives in Rust**.
+//! Core application state — **all logic lives in Rust, no webview.**
 //!
 //! * **Cursor**: a native OS `HCURSOR` built from a Rust-generated bitmap,
 //!   applied with `SetCursor` while the overlay owns the hit-testing. The OS
 //!   draws it, so it is smooth, pen-safe and visible over DirectComposition.
-//! * **Chromium webview**: pure-CSS presentation only (region box + status
-//!   text). No JS API / IPC — Rust pushes state via `evaluate_script` and
-//!   handles ALL interaction: global hotkeys (`Ctrl+Shift+C/R/O/0/Q`, `Esc`)
-//!   and mouse-driven region editing.
+//! * **Rendering**: the region box + status badge are drawn natively with GDI
+//!   into the layered window (`render::OverlaySurface`). No JS, no CSS.
+//! * **Interaction**: global hotkeys (`Ctrl+Shift+C/R/O/0/Q`, `Esc`) and
+//!   mouse-driven region editing, all in Rust.
 //! * **Handwriting**: when the pen is active (raw HID in-range / down), the
 //!   overlay goes click-through so the app below (e.g. OneNote) receives the
 //!   real Windows Ink / WM_POINTER stroke with pressure.
@@ -17,9 +17,7 @@ use crate::platform;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-/// A rectangle in logical (CSS) pixels, relative to the overlay window
-/// (origin = the overlay's top-left, which equals the target window's
-/// top-left when following one).
+/// A rectangle in logical (CSS) pixels, relative to the overlay window.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RectF {
     pub x: f32,
@@ -38,8 +36,7 @@ impl RectF {
 pub const MIN_REGION: f32 = 24.0;
 
 /// Sticky pen-mode decay (ms): once a pen is seen, stay click-through for
-/// this long after the last pen event, so strokes are never cut mid-way
-/// while the pen hovers or the app below holds the stroke.
+/// this long after the last pen event, so strokes are never cut mid-way.
 const PEN_ACTIVE_MS: u64 = 2000;
 
 /// Edge grab zone (logical px) for the region resize handles (Rust editing).
@@ -74,7 +71,6 @@ pub struct App {
     pub region: RectF,
     pub target_window: Option<String>,
     quit: bool,
-    force_push: bool,
 
     // --- target-window tracking ---
     target_hwnd: usize,
@@ -96,10 +92,6 @@ pub struct App {
     // --- per-frame state ---
     last_out_region: Option<Instant>,
     last_passthrough: Option<bool>,
-    last_sent: Option<String>,
-    /// How many startup ticks to force a state push (insurance so the webview
-    /// receives state even if it loads later than the first change).
-    startup_pushes: u32,
     last_pen_at: Option<Instant>,
 
     // --- Rust region editing (mouse) ---
@@ -110,6 +102,11 @@ pub struct App {
     // --- raw input ---
     raw: InputSnapshot,
     raw_rx: Option<Receiver<InputEvent>>,
+
+    // --- native render state ---
+    last_fp: String,
+    /// Last rendered status text (read by the renderer).
+    pub status_cache: String,
 }
 
 impl App {
@@ -126,7 +123,6 @@ impl App {
             },
             target_window,
             quit: false,
-            force_push: true,
             target_hwnd: 0,
             last_target_rect: None,
             window_follow_active: false,
@@ -134,8 +130,6 @@ impl App {
             native_hwnd: 0,
             #[cfg(target_os = "windows")]
             hcursor: {
-                // Build our reticle as a real OS cursor (Rust-drawn, OS shows
-                // it whenever we own the hit-testing).
                 let (rgba, hot) = cursor::make_cursor_bitmap(32);
                 let hc = platform::create_hcursor_from_rgba(&rgba, 32, 32, hot[0], hot[1]);
                 log::info!("created native cursor handle: {hc}");
@@ -147,16 +141,16 @@ impl App {
             win_w: 0.0,
             win_h: 0.0,
             win_origin: (0.0, 0.0),
-            startup_pushes: 60,
             last_out_region: None,
             last_passthrough: None,
-            last_sent: None,
             last_pen_at: None,
             left_down: false,
             prev_left_down: false,
             edit_drag: None,
             raw: InputSnapshot::default(),
             raw_rx: input::start(),
+            last_fp: String::new(),
+            status_cache: String::new(),
         }
     }
 
@@ -192,17 +186,16 @@ impl App {
         self.quit
     }
 
-    /// Force the next `tick` to push state to the webview (e.g. after the
-    /// page finished loading).
-    pub fn request_push(&mut self) {
-        self.force_push = true;
+    /// Force a redraw on the next tick (e.g. after a window resize).
+    pub fn invalidate(&mut self) {
+        self.last_fp.clear();
     }
 
     // ---- per-frame driver -------------------------------------------
 
-    /// Advance the state machine and return a JSON snapshot for the frontend
-    /// (or `None` if nothing changed since the last push).
-    pub fn tick(&mut self, window: &tao::window::Window) -> Option<String> {
+    /// Advance the state machine. Returns `true` when the overlay content
+    /// (region / status / modes) changed and should be redrawn.
+    pub fn tick(&mut self, window: &tao::window::Window) -> bool {
         // Global hotkeys (Rust).
         while let Some(hk) = input::take_hotkey() {
             self.apply_hotkey(hk);
@@ -239,8 +232,7 @@ impl App {
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(60));
 
         // Pen in use? While active we must NOT own the input — the app below
-        // needs the real Windows Ink / WM_POINTER stroke (our forwarding only
-        // replays *mouse* messages). Sticky decay keeps it stable.
+        // needs the real Windows Ink / WM_POINTER stroke. Sticky decay.
         let pen_active = self
             .last_pen_at
             .is_some_and(|t| t.elapsed().as_millis() < PEN_ACTIVE_MS as u128);
@@ -253,13 +245,6 @@ impl App {
         let overlay_on = self.enabled && !self.editing && self.window_follow_active;
         let owning = overlay_on && in_region_eff && !pen_active;
 
-        // Pass-through decision:
-        //  * no target / disabled  -> click-through (invisible layer)
-        //  * editing               -> non-click-through (so clicks don't hit
-        //                             the app below while we move the region)
-        //  * pen in use            -> click-through (app below gets real pen)
-        //  * overlay on, in region -> non-click-through (we own the cursor)
-        //  * overlay on, out region-> click-through (app below gets input)
         let passthrough = if !self.window_follow_active {
             true
         } else if self.editing {
@@ -284,9 +269,8 @@ impl App {
         #[cfg(target_os = "windows")]
         platform::set_forwarding(owning, self.native_hwnd);
 
-        // Native cursor (Rust): our circle while owning, a plain arrow while
-        // editing the region. Otherwise we leave the cursor alone (the app
-        // below owns it during pass-through).
+        // Native cursor (Rust): our circle while owning, an arrow while
+        // editing the region. Otherwise the app below owns the cursor.
         #[cfg(target_os = "windows")]
         {
             if owning {
@@ -296,44 +280,32 @@ impl App {
             }
         }
 
-        if self.force_push || self.startup_pushes > 0 {
-            if self.startup_pushes > 0 {
-                self.startup_pushes -= 1;
-            }
-            self.force_push = false;
-            self.last_sent = None;
-        }
+        self.status_cache = self.status_text(owning, pen_active);
 
-        let state = self.state_json(owning, in_region_eff, passthrough, pen_active);
-        if self.last_sent.as_deref() != Some(state.as_str()) {
-            self.last_sent = Some(state.clone());
-            log::debug!(
-                "owning={owning} passthrough={passthrough} pen={pen_active} found={} editing={} enabled={} cursor={}",
-                self.window_follow_active,
-                self.editing,
-                self.enabled,
-                self.hcursor
-            );
-            return Some(state);
-        }
-        None
+        let fp = format!(
+            "{}|{}|{}|{}|{}|{}|{:?}|{}",
+            self.enabled,
+            self.editing,
+            self.show_region,
+            owning,
+            passthrough,
+            pen_active,
+            self.region,
+            self.status_cache
+        );
+        let dirty = fp != self.last_fp;
+        self.last_fp = fp;
+        dirty
     }
 
     fn apply_hotkey(&mut self, hk: Hotkey) {
         match hk {
-            Hotkey::ToggleEnabled => {
-                self.enabled = !self.enabled;
-                self.force_push = true;
-            }
+            Hotkey::ToggleEnabled => self.enabled = !self.enabled,
             Hotkey::ToggleEditing => {
                 self.editing = !self.editing;
                 self.edit_drag = None;
-                self.force_push = true;
             }
-            Hotkey::ToggleOutline => {
-                self.show_region = !self.show_region;
-                self.force_push = true;
-            }
+            Hotkey::ToggleOutline => self.show_region = !self.show_region,
             Hotkey::RegionFull => {
                 self.region = RectF {
                     x: 0.0,
@@ -341,7 +313,6 @@ impl App {
                     w: self.win_w,
                     h: self.win_h,
                 };
-                self.force_push = true;
             }
             Hotkey::Quit => self.quit = true,
         }
@@ -425,7 +396,6 @@ impl App {
         nr.y = nr.y.clamp(0.0, (self.win_h - MIN_REGION).max(0.0));
         if nr != r {
             self.region = nr;
-            self.force_push = true;
         }
     }
 
@@ -583,32 +553,8 @@ impl App {
         };
         let on = if self.enabled { "ON" } else { "OFF" };
         format!(
-            "🎯 {t} · {mode} · {on}   |   Ctrl+Shift C:on/off  R:영역  O:윤곽  0:전체  Q:종료  Esc:종료"
+            "[{t}] {mode} {on}  |  Ctrl+Shift C:on/off R:영역 O:윤곽 0:전체 Q:종료 Esc:종료"
         )
-    }
-
-    fn state_json(&self, owning: bool, in_region: bool, passthrough: bool, pen_active: bool) -> String {
-        serde_json::json!({
-            "enabled": self.enabled,
-            "editing": self.editing,
-            "show_region": self.show_region,
-            "owning": owning,
-            "passthrough": passthrough,
-            "in_region": in_region,
-            "pen_active": pen_active,
-            "found": self.window_follow_active,
-            "target": self.target_window.clone().unwrap_or_default(),
-            "device": self.raw.last_device,
-            "status": self.status_text(owning, pen_active),
-            "region": {
-                "x": self.region.x,
-                "y": self.region.y,
-                "w": self.region.w,
-                "h": self.region.h,
-            },
-            "win": { "w": self.win_w, "h": self.win_h },
-        })
-        .to_string()
     }
 }
 

@@ -1,33 +1,26 @@
 [package]
 name = "custom-cursor-overlay"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Ultra-lightweight Chromium(WebView2)-based custom cursor overlay: a CSS-rendered cursor owned by a topmost transparent window, raw input forwarded to the app below. Rust (tao + wry) core."
+description = "Pure-native Rust custom cursor overlay: a transparent always-on-top window owns the cursor inside a region (OS HCURSOR), forwards ALL input to the app below, and draws the region/status with GDI. No webview, no JS."
 
-# The cursor is rendered by the embedded Chromium (WebView2 on Windows) via
-# pure CSS — the window owns the hit-testing inside the region, so apps below
-# can never override the cursor (no pen pop-out, works over DirectComposition).
-# The Rust core does the Win32 work: raw input capture (WH_MOUSE_LL + WM_INPUT),
-# target-window finding/following, region-based click pass-through
-# (WS_EX_TRANSPARENT) and input forwarding to the app below (PostMessage).
-#
-# Note: on Linux, wry requires the webkit2gtk-4.1 system libraries to build.
-# The target platform is Windows, where wry uses the system WebView2 runtime.
+# 100% native (no webview): the overlay window is a transparent layered tao
+# window. The cursor is a real OS HCURSOR built from a Rust bitmap and applied
+# with SetCursor. Input is captured with WH_MOUSE_LL + WM_INPUT and forwarded
+# to the app below via PostMessage. Region box + status are drawn with GDI
+# into the layered window (UpdateLayeredWindow). Everything is Rust.
 
 [dependencies]
 tao = "0.37"
-wry = "0.56"
-serde_json = "1"
 log = "0.4"
 env_logger = "0.11"
-raw-window-handle = "0.6"
 
-# Windows: raw Win32 API via windows-sys — global cursor, click pass-through
-# (WS_EX_TRANSPARENT), target-window tracking and low-level input
-# (WH_MOUSE_LL hook + RegisterRawInputDevices / WM_INPUT for mouse, pen,
-# touch and trackpad), plus input forwarding (PostMessage to the app below).
+# Windows: raw Win32 API via windows-sys — global cursor, real HCURSOR,
+# click pass-through (WS_EX_TRANSPARENT), target-window tracking, low-level
+# input (WH_MOUSE_LL / WH_KEYBOARD_LL / WM_INPUT), input forwarding
+# (PostMessage) and GDI overlay rendering (UpdateLayeredWindow).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Media"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [profile.release]
 opt-level = 3
