@@ -1,26 +1,18 @@
-//! Core application state: region, target-window tracking, and the
-//! cursor-owning / pass-through decision.
+//! Core application state — **all logic lives in Rust**.
 //!
-//! The cursor is rendered **natively in Rust** (an OS `HCURSOR` built from a
-//! Rust-generated bitmap, applied with `SetCursor` while we own the
-//! hit-testing). The Chromium webview is only a thin UI layer (status bar,
-//! settings panel, region editor) and never draws the cursor.
-//!
-//! * inside the region the overlay window is **non-click-through** — it owns
-//!   the hit-testing (and therefore `WM_SETCURSOR`), so the app below can
-//!   never override the cursor (no pen pop-out, works over DirectComposition)
-//!   and the OS draws our circle. All pointer input is then forwarded to the
-//!   app below (`platform::forward_mouse`).
-//! * outside the region the overlay is **click-through** (`WS_EX_TRANSPARENT`)
-//!   — the app below keeps its own cursor and input.
-//! * without a target window (or while it is missing) the overlay stays a
-//!   fully click-through, invisible layer.
-//!
-//! The frontend is a *view*: it renders whatever [`App::tick`] reports and
-//! sends editing commands back through [`App::handle_ipc`].
+//! * **Cursor**: a native OS `HCURSOR` built from a Rust-generated bitmap,
+//!   applied with `SetCursor` while the overlay owns the hit-testing. The OS
+//!   draws it, so it is smooth, pen-safe and visible over DirectComposition.
+//! * **Chromium webview**: pure-CSS presentation only (region box + status
+//!   text). No JS API / IPC — Rust pushes state via `evaluate_script` and
+//!   handles ALL interaction: global hotkeys (`Ctrl+Shift+C/R/O/0/Q`, `Esc`)
+//!   and mouse-driven region editing.
+//! * **Handwriting**: when the pen is active (raw HID in-range / down), the
+//!   overlay goes click-through so the app below (e.g. OneNote) receives the
+//!   real Windows Ink / WM_POINTER stroke with pressure.
 
 use crate::cursor;
-use crate::input::{self, InputEvent, InputSnapshot};
+use crate::input::{self, Hotkey, InputEvent, InputSnapshot};
 use crate::platform;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -42,20 +34,43 @@ impl RectF {
     }
 }
 
-/// Minimum region size (logical px) enforced by the frontend editor.
+/// Minimum region size (logical px).
 pub const MIN_REGION: f32 = 24.0;
 
-/// How long the overlay stays in “pen mode” (click-through) after the last
-/// pen event, so the app below receives real Windows Ink / WM_POINTER
-/// strokes without us stealing them.
-const PEN_ACTIVE_MS: u64 = 1200;
+/// Sticky pen-mode decay (ms): once a pen is seen, stay click-through for
+/// this long after the last pen event, so strokes are never cut mid-way
+/// while the pen hovers or the app below holds the stroke.
+const PEN_ACTIVE_MS: u64 = 2000;
+
+/// Edge grab zone (logical px) for the region resize handles (Rust editing).
+const HANDLE: f32 = 14.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum EditMode {
+    Move,
+    ResizeN,
+    ResizeS,
+    ResizeE,
+    ResizeW,
+    ResizeNE,
+    ResizeNW,
+    ResizeSE,
+    ResizeSW,
+}
+
+/// An in-progress region edit drag (Rust-driven, no JS).
+struct EditDrag {
+    mode: EditMode,
+    sx: f32,
+    sy: f32,
+    region: RectF,
+}
 
 pub struct App {
-    // --- settings (mirrored to / edited from the frontend) ---
+    // --- settings (toggled by Rust hotkeys) ---
     pub enabled: bool,
     pub editing: bool,
     pub show_region: bool,
-    pub settings_open: bool,
     pub region: RectF,
     pub target_window: Option<String>,
     quit: bool,
@@ -79,18 +94,15 @@ pub struct App {
     win_origin: (f32, f32),
 
     // --- per-frame state ---
-    /// When the pointer left the region (for the 60 ms out-of-region grace).
     last_out_region: Option<Instant>,
     last_passthrough: Option<bool>,
     last_sent: Option<String>,
-    /// Frontend UI rectangles (logical px, window-local): status bar,
-    /// settings panel. Forwarded clicks inside them are swallowed so our UI
-    /// doesn't double-fire into the app below.
-    ui_rects: Vec<(f32, f32, f32, f32)>,
-    /// Last pen activity (raw HID `Pen` events).
     last_pen_at: Option<Instant>,
-    /// Last pen activity reported by the frontend (PointerEvent type=pen).
-    frontend_pen_at: Option<Instant>,
+
+    // --- Rust region editing (mouse) ---
+    left_down: bool,
+    prev_left_down: bool,
+    edit_drag: Option<EditDrag>,
 
     // --- raw input ---
     raw: InputSnapshot,
@@ -103,7 +115,6 @@ impl App {
             enabled: true,
             editing: false,
             show_region: false,
-            settings_open: false,
             region: RectF {
                 x: 0.0,
                 y: 0.0,
@@ -134,9 +145,10 @@ impl App {
             last_out_region: None,
             last_passthrough: None,
             last_sent: None,
-            ui_rects: Vec::new(),
             last_pen_at: None,
-            frontend_pen_at: None,
+            left_down: false,
+            prev_left_down: false,
+            edit_drag: None,
             raw: InputSnapshot::default(),
             raw_rx: input::start(),
         }
@@ -160,8 +172,6 @@ impl App {
     pub fn set_window_size(&mut self, w: f64, h: f64) {
         self.win_w = w as f32;
         self.win_h = h as f32;
-        // If we are not following a target yet, default the region to the
-        // whole window so the frontend always has a sensible starting box.
         if !self.window_follow_active && self.region.w <= 0.0 {
             self.region = RectF {
                 x: 0.0,
@@ -176,16 +186,30 @@ impl App {
         self.quit
     }
 
+    /// Force the next `tick` to push state to the webview (e.g. after the
+    /// page finished loading).
+    pub fn request_push(&mut self) {
+        self.force_push = true;
+    }
+
     // ---- per-frame driver -------------------------------------------
 
     /// Advance the state machine and return a JSON snapshot for the frontend
     /// (or `None` if nothing changed since the last push).
     pub fn tick(&mut self, window: &tao::window::Window) -> Option<String> {
+        // Global hotkeys (Rust).
+        while let Some(hk) = input::take_hotkey() {
+            self.apply_hotkey(hk);
+        }
+
         // Drain raw input (mouse / pen / touch) into the snapshot.
         if let Some(rx) = &self.raw_rx {
             while let Ok(ev) = rx.try_recv() {
                 if matches!(ev, InputEvent::Pen { .. }) {
                     self.last_pen_at = Some(Instant::now());
+                }
+                if let InputEvent::MouseButton { left: true, down, .. } = ev {
+                    self.left_down = down;
                 }
                 self.raw.apply(&ev);
             }
@@ -197,9 +221,7 @@ impl App {
         let (plx, ply) = self.pointer_local();
         let in_region = self.window_follow_active && self.region.contains(plx, ply);
 
-        // Hysteresis: a pen can briefly glitch the reported position the
-        // instant it touches, so don't drop the owned cursor on a momentary
-        // out-of-region sample — keep it for 60 ms after leaving.
+        // 60 ms out-of-region grace (pen/mouse jitter at the boundary).
         if in_region {
             self.last_out_region = None;
         } else {
@@ -210,32 +232,31 @@ impl App {
                 .last_out_region
                 .is_some_and(|t| t.elapsed() < Duration::from_millis(60));
 
-        // Pen in use? While the pen is active we must NOT own the input —
-        // the app below needs the real Windows Ink / WM_POINTER stroke. We
-        // go click-through instead (our forwarding only replays *mouse*
-        // messages, which Ink pens don't always synthesize). Decay keeps it
-        // stable across small gaps.
-        let now = Instant::now();
+        // Pen in use? While active we must NOT own the input — the app below
+        // needs the real Windows Ink / WM_POINTER stroke (our forwarding only
+        // replays *mouse* messages). Sticky decay keeps it stable.
         let pen_active = self
             .last_pen_at
-            .is_some_and(|t| now.duration_since(t).as_millis() < PEN_ACTIVE_MS as u128)
-            || self
-                .frontend_pen_at
-                .is_some_and(|t| now.duration_since(t).as_millis() < PEN_ACTIVE_MS as u128);
+            .is_some_and(|t| t.elapsed().as_millis() < PEN_ACTIVE_MS as u128);
 
-        let overlay_on =
-            self.enabled && !self.editing && !self.settings_open && self.window_follow_active;
+        // Rust-driven region editing (drag with the mouse).
+        if self.editing {
+            self.update_edit((plx, ply));
+        }
+
+        let overlay_on = self.enabled && !self.editing && self.window_follow_active;
         let owning = overlay_on && in_region_eff && !pen_active;
 
         // Pass-through decision:
-        //  * no target / disabled   -> click-through (invisible layer)
-        //  * editing / settings     -> non-click-through (frontend needs input)
-        //  * pen in use             -> click-through (app below gets real pen)
-        //  * overlay on, in region  -> non-click-through (we own the cursor)
-        //  * overlay on, out region -> click-through (app below gets input)
+        //  * no target / disabled  -> click-through (invisible layer)
+        //  * editing               -> non-click-through (so clicks don't hit
+        //                             the app below while we move the region)
+        //  * pen in use            -> click-through (app below gets real pen)
+        //  * overlay on, in region -> non-click-through (we own the cursor)
+        //  * overlay on, out region-> click-through (app below gets input)
         let passthrough = if !self.window_follow_active {
             true
-        } else if self.editing || self.settings_open {
+        } else if self.editing {
             false
         } else if pen_active {
             true
@@ -257,35 +278,16 @@ impl App {
         #[cfg(target_os = "windows")]
         platform::set_forwarding(owning, self.native_hwnd);
 
-        // Push the frontend UI rectangles (status bar / settings panel) so
-        // clicks over our own UI are not replayed to the app below.
+        // Native cursor (Rust): our circle while owning, a plain arrow while
+        // editing the region. Otherwise we leave the cursor alone (the app
+        // below owns it during pass-through).
         #[cfg(target_os = "windows")]
         {
-            let s = self.scale.max(0.1);
-            let phys: Vec<(i32, i32, i32, i32)> = self
-                .ui_rects
-                .iter()
-                .map(|&(x, y, w, h)| {
-                    let (ox, oy) = self.win_origin;
-                    (
-                        (ox + x * s) as i32,
-                        (oy + y * s) as i32,
-                        (ox + (x + w) * s) as i32,
-                        (oy + (y + h) * s) as i32,
-                    )
-                })
-                .collect();
-            platform::set_forward_block_rects(&phys);
-        }
-
-        // Native cursor (Rust): while we own the hit-testing, make the OS draw
-        // our circle (re-asserted each tick so the webview's `cursor: none`
-        // can't override it). Otherwise we leave the cursor alone — the webview
-        // shows its default arrow for the UI, and outside the region the app
-        // below owns the cursor.
-        #[cfg(target_os = "windows")]
-        if owning {
-            platform::set_cursor_handle(Some(self.hcursor));
+            if owning {
+                platform::set_cursor_handle(Some(self.hcursor));
+            } else if self.editing {
+                platform::set_cursor_handle(None);
+            }
         }
 
         if self.force_push {
@@ -301,103 +303,148 @@ impl App {
         None
     }
 
-    /// Handle a command message from the frontend (`window.ipc.postMessage`).
-    pub fn handle_ipc(&mut self, json: &str) {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
-            return;
-        };
-        let Some(cmd) = v.get("cmd").and_then(|c| c.as_str()) else {
-            return;
-        };
-        match cmd {
-            "ready" => self.force_push = true,
-            "set_enabled" => self.enabled = Self::bool_at(&v, "value", self.enabled),
-            "set_editing" => self.editing = Self::bool_at(&v, "value", self.editing),
-            "set_show_region" => self.show_region = Self::bool_at(&v, "value", self.show_region),
-            "settings" => self.settings_open = Self::bool_at(&v, "value", self.settings_open),
-            "set_region" => {
-                let f = |k: &str, d: f32| -> f32 {
-                    v.get(k).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32
-                };
+    fn apply_hotkey(&mut self, hk: Hotkey) {
+        match hk {
+            Hotkey::ToggleEnabled => {
+                self.enabled = !self.enabled;
+                self.force_push = true;
+            }
+            Hotkey::ToggleEditing => {
+                self.editing = !self.editing;
+                self.edit_drag = None;
+                self.force_push = true;
+            }
+            Hotkey::ToggleOutline => {
+                self.show_region = !self.show_region;
+                self.force_push = true;
+            }
+            Hotkey::RegionFull => {
                 self.region = RectF {
-                    x: f("x", self.region.x),
-                    y: f("y", self.region.y),
-                    w: f("w", self.region.w).max(MIN_REGION),
-                    h: f("h", self.region.h).max(MIN_REGION),
+                    x: 0.0,
+                    y: 0.0,
+                    w: self.win_w,
+                    h: self.win_h,
                 };
-            }
-            "set_ui_rects" => {
-                self.ui_rects = v
-                    .get("rects")
-                    .and_then(|r| r.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|r| {
-                                let f = |k: &str| r.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-                                Some((f("x"), f("y"), f("w"), f("h")))
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-            }
-            "set_target" => {
-                let title = v
-                    .get("title")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                self.target_window = (!title.is_empty()).then_some(title);
-                // Re-find next tick; update_target_window handles the
-                // window-size transition (restore fullscreen if cleared).
-                self.target_hwnd = 0;
-                self.region_initialized_for_target = false;
-                self.last_target_rect = None;
                 self.force_push = true;
             }
-            "preset" => {
-                let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                match name {
-                    "fullscreen" | "reset" => {
-                        self.region = RectF {
-                            x: 0.0,
-                            y: 0.0,
-                            w: self.win_w,
-                            h: self.win_h,
-                        };
-                    }
-                    "center" => {
-                        let w = self.win_w.min(960.0);
-                        let h = self.win_h.min(540.0);
-                        self.region = RectF {
-                            x: ((self.win_w - w) / 2.0).max(0.0),
-                            y: ((self.win_h - h) / 2.0).max(0.0),
-                            w,
-                            h,
-                        };
-                    }
-                    _ => {}
-                }
-                self.force_push = true;
-            }
-            "quit" => self.quit = true,
-            "pen_active" => {
-                let active = v
-                    .get("value")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(false);
-                self.frontend_pen_at = if active {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-            }
-            _ => {}
+            Hotkey::Quit => self.quit = true,
         }
     }
 
-    fn bool_at(v: &serde_json::Value, key: &str, def: bool) -> bool {
-        v.get(key).and_then(|x| x.as_bool()).unwrap_or(def)
+    // ---- Rust region editing (mouse drag) ---------------------------
+
+    fn update_edit(&mut self, p: (f32, f32)) {
+        let (px, py) = p;
+        let down = self.left_down;
+        let pressed = down && !self.prev_left_down;
+        let released = !down && self.prev_left_down;
+        self.prev_left_down = down;
+
+        if released {
+            self.edit_drag = None;
+            return;
+        }
+
+        if self.edit_drag.is_none() && pressed {
+            if let Some(mode) = self.grab_mode(px, py) {
+                self.edit_drag = Some(EditDrag {
+                    mode,
+                    sx: px,
+                    sy: py,
+                    region: self.region,
+                });
+            }
+        }
+
+        let Some(d) = &self.edit_drag else {
+            return;
+        };
+        let dx = px - d.sx;
+        let dy = py - d.sy;
+        let r = d.region;
+        let mut nr = r;
+        match d.mode {
+            EditMode::Move => {
+                nr.x = (r.x + dx).clamp(0.0, (self.win_w - r.w).max(0.0));
+                nr.y = (r.y + dy).clamp(0.0, (self.win_h - r.h).max(0.0));
+            }
+            EditMode::ResizeE => nr.w = (r.w + dx).max(MIN_REGION),
+            EditMode::ResizeS => nr.h = (r.h + dy).max(MIN_REGION),
+            EditMode::ResizeW => {
+                let w = (r.w - dx).max(MIN_REGION);
+                nr.x = r.x + (r.w - w);
+                nr.w = w;
+            }
+            EditMode::ResizeN => {
+                let h = (r.h - dy).max(MIN_REGION);
+                nr.y = r.y + (r.h - h);
+                nr.h = h;
+            }
+            EditMode::ResizeNE => {
+                nr.w = (r.w + dx).max(MIN_REGION);
+                let h = (r.h - dy).max(MIN_REGION);
+                nr.y = r.y + (r.h - h);
+                nr.h = h;
+            }
+            EditMode::ResizeNW => {
+                let w = (r.w - dx).max(MIN_REGION);
+                nr.x = r.x + (r.w - w);
+                nr.w = w;
+                let h = (r.h - dy).max(MIN_REGION);
+                nr.y = r.y + (r.h - h);
+                nr.h = h;
+            }
+            EditMode::ResizeSE => {
+                nr.w = (r.w + dx).max(MIN_REGION);
+                nr.h = (r.h + dy).max(MIN_REGION);
+            }
+            EditMode::ResizeSW => {
+                let w = (r.w - dx).max(MIN_REGION);
+                nr.x = r.x + (r.w - w);
+                nr.w = w;
+                nr.h = (r.h + dy).max(MIN_REGION);
+            }
+        }
+        nr.x = nr.x.clamp(0.0, (self.win_w - MIN_REGION).max(0.0));
+        nr.y = nr.y.clamp(0.0, (self.win_h - MIN_REGION).max(0.0));
+        if nr != r {
+            self.region = nr;
+            self.force_push = true;
+        }
+    }
+
+    /// Which region handle (or move) the pointer is grabbing, if any.
+    fn grab_mode(&self, px: f32, py: f32) -> Option<EditMode> {
+        let r = self.region;
+        let (x0, y0, x1, y1) = (r.x, r.y, r.x + r.w, r.y + r.h);
+        let in_x = px >= x0 - HANDLE && px <= x1 + HANDLE;
+        let in_y = py >= y0 - HANDLE && py <= y1 + HANDLE;
+        let on_left = (px - x0).abs() <= HANDLE;
+        let on_right = (px - x1).abs() <= HANDLE;
+        let on_top = (py - y0).abs() <= HANDLE;
+        let on_bottom = (py - y1).abs() <= HANDLE;
+        let mode = if on_top && on_left {
+            EditMode::ResizeNW
+        } else if on_top && on_right {
+            EditMode::ResizeNE
+        } else if on_bottom && on_left {
+            EditMode::ResizeSW
+        } else if on_bottom && on_right {
+            EditMode::ResizeSE
+        } else if on_left && in_y {
+            EditMode::ResizeW
+        } else if on_right && in_y {
+            EditMode::ResizeE
+        } else if on_top && in_x {
+            EditMode::ResizeN
+        } else if on_bottom && in_x {
+            EditMode::ResizeS
+        } else if r.contains(px, py) {
+            EditMode::Move
+        } else {
+            return None;
+        };
+        Some(mode)
     }
 
     // ---- helpers -----------------------------------------------------
@@ -441,8 +488,6 @@ impl App {
             }
             let hwnd = self.target_hwnd;
             if hwnd == 0 {
-                // Not found (yet) — stay inactive, restore fullscreen if we
-                // were following something before.
                 if self.window_follow_active {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
                     self.window_follow_active = false;
@@ -480,7 +525,6 @@ impl App {
                         self.win_w = (r - l) as f32 / scale;
                         self.win_h = (b - t) as f32 / scale;
                         if !self.region_initialized_for_target {
-                            // Default: cover the whole target window.
                             self.region_initialized_for_target = true;
                             self.region = RectF {
                                 x: 0.0,
@@ -492,7 +536,6 @@ impl App {
                     }
                 }
                 None => {
-                    // Target closed / invalid — re-find it next frame.
                     self.target_hwnd = 0;
                     self.last_target_rect = None;
                     if self.window_follow_active {
@@ -510,12 +553,28 @@ impl App {
         }
     }
 
+    fn status_text(&self, owning: bool, pen_active: bool) -> String {
+        let t = self.target_window.clone().unwrap_or_default();
+        let mode = if self.editing {
+            "영역편집"
+        } else if pen_active {
+            "펜"
+        } else if owning {
+            "커서"
+        } else {
+            "대기"
+        };
+        let on = if self.enabled { "ON" } else { "OFF" };
+        format!(
+            "🎯 {t} · {mode} · {on}   |   Ctrl+Shift C:on/off  R:영역  O:윤곽  0:전체  Q:종료  Esc:종료"
+        )
+    }
+
     fn state_json(&self, owning: bool, in_region: bool, passthrough: bool, pen_active: bool) -> String {
         serde_json::json!({
             "enabled": self.enabled,
             "editing": self.editing,
             "show_region": self.show_region,
-            "settings": self.settings_open,
             "owning": owning,
             "passthrough": passthrough,
             "in_region": in_region,
@@ -523,6 +582,7 @@ impl App {
             "found": self.window_follow_active,
             "target": self.target_window.clone().unwrap_or_default(),
             "device": self.raw.last_device,
+            "status": self.status_text(owning, pen_active),
             "region": {
                 "x": self.region.x,
                 "y": self.region.y,
@@ -537,7 +597,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        // Stop the raw-input threads / unhook the low-level hook.
+        // Stop the raw-input threads / unhook the low-level hooks.
         input::stop();
         // Disable input forwarding so no replay happens after teardown.
         #[cfg(target_os = "windows")]

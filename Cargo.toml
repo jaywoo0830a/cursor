@@ -27,7 +27,7 @@ raw-window-handle = "0.6"
 # (WH_MOUSE_LL hook + RegisterRawInputDevices / WM_INPUT for mouse, pen,
 # touch and trackpad), plus input forwarding (PostMessage to the app below).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_Media"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_UI_Input_KeyboardAndMouse", "Win32_Media"] }
 
 [profile.release]
 opt-level = 3

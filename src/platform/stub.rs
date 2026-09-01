@@ -32,9 +32,9 @@ pub fn is_iconic(_hwnd: HWND) -> bool {
 
 pub fn apply_passthrough(_hwnd: usize, _passthrough: bool) {}
 
-pub fn set_forwarding(_enabled: bool, _our_hwnd: usize) {}
+pub fn polish_overlay_window(_hwnd: usize) {}
 
-pub fn set_forward_block_rects(_rects: &[(i32, i32, i32, i32)]) {}
+pub fn set_forwarding(_enabled: bool, _our_hwnd: usize) {}
 
 pub fn forward_mouse(_x: i32, _y: i32, _msg: u32, _wparam: usize) {}
 

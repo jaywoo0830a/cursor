@@ -31,7 +31,7 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop};
 use tao::window::{Fullscreen, WindowBuilder};
 use wry::http::{Response, StatusCode};
-use wry::WebViewBuilder;
+use wry::{PageLoadEvent, WebViewBuilder};
 
 /// The whole frontend (cursor CSS, region editor, settings UI) is embedded
 /// here so the app runs fully offline with no external files or CDNs.
@@ -66,13 +66,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared app state (main loop + IPC handler).
     let app_arc = Arc::new(Mutex::new(app::App::new(Some(target))));
 
-    // Grab the native HWND so we can toggle WS_EX_TRANSPARENT directly.
+    // Grab the native HWND so we can toggle WS_EX_TRANSPARENT directly and
+    // polish the window (transparent + hidden from the taskbar / Alt-Tab).
     {
         let mut app = app_arc.lock().unwrap();
         #[cfg(target_os = "windows")]
         {
             use tao::platform::windows::WindowExtWindows;
-            app.set_native_hwnd(window.hwnd() as usize);
+            let hwnd = window.hwnd() as usize;
+            app.set_native_hwnd(hwnd);
+            platform::polish_overlay_window(hwnd);
         }
         let scale = window.scale_factor();
         app.set_scale(scale);
@@ -80,8 +83,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.set_window_size(size.width as f64 / scale, size.height as f64 / scale);
     }
 
-    // Embed the Chromium webview (WebView2 on Windows) and serve the offline
-    // frontend over a custom `local://` protocol.
+    // Embed the Chromium webview (WebView2 on Windows). It is a pure-CSS,
+    // non-interactive view (no JS API): Rust pushes presentation state via
+    // evaluate_script and handles all input/hotkeys/editing itself.
     let webview = WebViewBuilder::new()
         .with_transparent(true)
         .with_focused(false)
@@ -95,11 +99,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .body(INDEX_HTML.as_bytes().into())
                 .unwrap()
         })
-        .with_ipc_handler({
+        .with_on_page_load_handler({
             let app = app_arc.clone();
-            move |request| {
-                let body = request.body().clone();
-                app.lock().unwrap().handle_ipc(&body);
+            move |event, _url| {
+                if matches!(event, PageLoadEvent::Finished) {
+                    app.lock().unwrap().request_push();
+                }
             }
         })
         .build(&window)?;

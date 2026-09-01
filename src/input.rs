@@ -189,6 +189,28 @@ pub fn last_global_mouse_pos() -> Option<(f64, f64)> {
     }
 }
 
+/// Global hotkeys handled by Rust (no JS / no webview needed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hotkey {
+    ToggleEnabled,
+    ToggleEditing,
+    ToggleOutline,
+    RegionFull,
+    Quit,
+}
+
+/// Consume the most recent hotkey (if any). Called by the app each tick.
+pub fn take_hotkey() -> Option<Hotkey> {
+    #[cfg(target_os = "windows")]
+    {
+        win::take_hotkey()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Windows implementation (raw Win32 API via windows-sys)
 // ---------------------------------------------------------------------------
@@ -207,7 +229,10 @@ mod win {
 
     static EVENT_TX: OnceLock<Sender<InputEvent>> = OnceLock::new();
     static HOOK: AtomicUsize = AtomicUsize::new(0);
+    static KBD_HOOK: AtomicUsize = AtomicUsize::new(0);
     static LAST_POS: AtomicU64 = AtomicU64::new(0);
+    /// Pending hotkey id (0 = none), set by the keyboard hook.
+    static HOTKEY: AtomicUsize = AtomicUsize::new(0);
     static STOP: AtomicBool = AtomicBool::new(false);
     /// Raw input events are merged here and flushed to the app at ~1 ms, so
     /// high-rate HID devices (pen / touch / high-polling mice) don't flood
@@ -248,6 +273,24 @@ mod win {
             unsafe {
                 wam::UnhookWindowsHookEx(h as *mut core::ffi::c_void);
             }
+        }
+        let k = KBD_HOOK.swap(0, Ordering::SeqCst);
+        if k != 0 {
+            unsafe {
+                wam::UnhookWindowsHookEx(k as *mut core::ffi::c_void);
+            }
+        }
+    }
+
+    pub fn take_hotkey() -> Option<super::Hotkey> {
+        let id = HOTKEY.swap(0, Ordering::SeqCst);
+        match id {
+            1 => Some(super::Hotkey::ToggleEnabled),
+            2 => Some(super::Hotkey::ToggleEditing),
+            3 => Some(super::Hotkey::ToggleOutline),
+            4 => Some(super::Hotkey::RegionFull),
+            5 => Some(super::Hotkey::Quit),
+            _ => None,
         }
     }
 
@@ -488,7 +531,41 @@ mod win {
         map
     }
 
-    /// The raw-input thread: installs the mouse hook, registers HID
+    /// Global keyboard hook: turns Ctrl+Shift+C/R/O/0/Q and Esc into hotkey
+    /// ids, so settings / region editing / quit all live in Rust (the webview
+    /// does not need to be focused or even receive input).
+    unsafe extern "system" fn keyboard_ll_hook(code: i32, wparam: usize, lparam: isize) -> isize {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+        if code >= 0 && (wparam as u32) == wam::WM_KEYDOWN {
+            let k = &*(lparam as *const wam::KBDLLHOOKSTRUCT);
+            const VK_CONTROL: i32 = 0x11;
+            const VK_SHIFT: i32 = 0x10;
+            const VK_ESCAPE: i32 = 0x1B;
+            let ctrl = GetKeyState(VK_CONTROL) < 0;
+            let shift = GetKeyState(VK_SHIFT) < 0;
+            let vk = k.vkCode;
+            let id = if ctrl && shift {
+                match vk {
+                    0x43 => 1, // Ctrl+Shift+C -> toggle enabled
+                    0x52 => 2, // Ctrl+Shift+R -> toggle region editing
+                    0x4F => 3, // Ctrl+Shift+O -> toggle region outline
+                    0x30 => 4, // Ctrl+Shift+0 -> region = full window
+                    0x51 => 5, // Ctrl+Shift+Q -> quit
+                    _ => 0,
+                }
+            } else if vk == VK_ESCAPE as u32 {
+                5 // Esc -> quit
+            } else {
+                0
+            };
+            if id != 0 {
+                HOTKEY.store(id, Ordering::SeqCst);
+            }
+        }
+        wam::CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+    }
+
+    /// The raw-input thread: installs the mouse + keyboard hooks, registers HID
     /// digitizer devices and runs its own message loop.
     fn raw_input_thread() {
         unsafe {
@@ -543,6 +620,22 @@ mod win {
                 HOOK.store(hook as usize, Ordering::SeqCst);
             }
 
+            // Global keyboard hook for the Rust-driven hotkeys.
+            let kbd = wam::SetWindowsHookExW(
+                wam::WH_KEYBOARD_LL,
+                Some(keyboard_ll_hook),
+                std::ptr::null_mut(),
+                0,
+            );
+            if kbd.is_null() {
+                log::warn!(
+                    "SetWindowsHookExW(WH_KEYBOARD_LL) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                KBD_HOOK.store(kbd as usize, Ordering::SeqCst);
+            }
+
             let mut msg = std::mem::zeroed::<wam::MSG>();
             while wam::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                 if msg.message == wam::WM_INPUT {
@@ -557,6 +650,10 @@ mod win {
                 wam::UnhookWindowsHookEx(hook);
             }
             HOOK.store(0, Ordering::SeqCst);
+            if !kbd.is_null() {
+                wam::UnhookWindowsHookEx(kbd);
+            }
+            KBD_HOOK.store(0, Ordering::SeqCst);
         }
     }
 

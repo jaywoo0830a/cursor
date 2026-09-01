@@ -14,7 +14,6 @@
 //! * forwarding pointer input to the app below (`PostMessage`)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 /// A Windows window handle (`HWND`).
 pub type HWND = *mut core::ffi::c_void;
@@ -186,9 +185,7 @@ pub fn is_iconic(hwnd: HWND) -> bool {
 }
 
 /// Force click pass-through on/off by directly toggling the window's
-/// `WS_EX_TRANSPARENT` style. This is a direct fallback on top of
-/// winit's own mechanism (`set_cursor_hittest`), for setups where the
-/// winit path is unreliable. `WS_EX_LAYERED` is kept for transparency.
+/// `WS_EX_TRANSPARENT` style. `WS_EX_LAYERED` is kept for transparency.
 pub fn apply_passthrough(hwnd: usize, passthrough: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
@@ -205,6 +202,24 @@ pub fn apply_passthrough(hwnd: usize, passthrough: bool) {
     }
 }
 
+/// Make the overlay window a proper transparent tool window: ensure
+/// `WS_EX_LAYERED` (for alpha) + `WS_EX_TOOLWINDOW` (no taskbar entry / no
+/// Alt-Tab, so it doesn't look like a normal Win7-style window).
+pub fn polish_overlay_window(hwnd: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    };
+    unsafe {
+        let h = hwnd as *mut core::ffi::c_void;
+        let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        SetWindowLongPtrW(
+            h,
+            GWL_EXSTYLE,
+            style | (WS_EX_LAYERED | WS_EX_TOOLWINDOW) as isize,
+        );
+    }
+}
+
 // (system-cursor swapping removed — the Chromium frontend owns the cursor)
 // ---------------------------------------------------------------------------
 // Input forwarding — cursor-owning mode
@@ -217,10 +232,6 @@ pub fn apply_passthrough(hwnd: usize, passthrough: bool) {
 
 static FORWARD_ON: AtomicBool = AtomicBool::new(false);
 static FORWARD_HWND: AtomicUsize = AtomicUsize::new(0);
-/// Rectangles (physical screen px) where forwarded clicks are swallowed —
-/// i.e. the frontend's own UI (status bar, settings panel). Points inside
-/// are not replayed to the app below, so clicking our UI doesn't double-fire.
-static FORWARD_BLOCK: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
 
 /// Enable/disable forwarding of pointer input to the window below our
 /// overlay. `our_hwnd` is the overlay window (excluded from the target
@@ -228,12 +239,6 @@ static FORWARD_BLOCK: Mutex<Vec<(i32, i32, i32, i32)>> = Mutex::new(Vec::new());
 pub fn set_forwarding(enabled: bool, our_hwnd: usize) {
     FORWARD_ON.store(enabled, Ordering::Relaxed);
     FORWARD_HWND.store(our_hwnd, Ordering::Relaxed);
-}
-
-/// Set the frontend-UI rectangles (physical screen px) that must not be
-/// replayed to the app below.
-pub fn set_forward_block_rects(rects: &[(i32, i32, i32, i32)]) {
-    *FORWARD_BLOCK.lock().unwrap() = rects.to_vec();
 }
 
 /// Topmost visible top-level window (excluding `exclude`) whose rect contains
@@ -273,16 +278,6 @@ pub fn forward_mouse(pt_x: i32, pt_y: i32, msg: u32, wparam: usize) {
     };
     if !FORWARD_ON.load(Ordering::Relaxed) {
         return;
-    }
-    // Don't replay clicks that landed on our own frontend UI.
-    {
-        let block = FORWARD_BLOCK.lock().unwrap();
-        if block
-            .iter()
-            .any(|&(x1, y1, x2, y2)| pt_x >= x1 && pt_x < x2 && pt_y >= y1 && pt_y < y2)
-        {
-            return;
-        }
     }
     let exclude = FORWARD_HWND.load(Ordering::Relaxed);
     unsafe {
