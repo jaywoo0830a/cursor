@@ -21,10 +21,13 @@ apps below (Windows). Outside the region the normal system cursor is used.
 - **OS bitmap cursor by default** — Windows draws the cursor itself, so it is
   visible over *any* app, including GPU/DirectComposition canvases such as
   PDF viewers where the system cursor would otherwise be covered or
-  overridden. On Windows the *system cursor bitmaps* (`OCR_NORMAL`, I-beam,
-  hand, …) are swapped with our circle via `SetSystemCursor` while the
-  pointer is inside the region, so apps that switch cursors still show ours —
-  and, crucially, this now works **together with click pass-through**.
+  overridden. On Windows the *system cursor bitmaps* (**all** `OCR_*` ids:
+  arrow, I-beam, hand, busy, no-drop, resize arrows, …) are swapped with our
+  circle via `SetSystemCursor` while the pointer is inside the region, so
+  **every cursor state stays a circle** — even while typing (I-beam) or
+  hovering (hand) — and it now works **together with click pass-through**.
+  The global `WH_MOUSE_LL` hook also re-asserts the circle on every mouse
+  event, defeating apps that set their own *custom* cursors.
 - **Click pass-through (both modes):** clicks pass through the overlay to the
   apps below — either with the OS bitmap cursor (system cursor swap) or with
   the egui-painted cursor (`ShowCursor` hiding). Enforced directly with

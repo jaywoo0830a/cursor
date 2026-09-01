@@ -705,6 +705,19 @@ impl eframe::App for CursorOverlayApp {
         // ---- custom cursor behavior ----
         let in_region = pointer.is_some_and(|p| self.region.contains(p));
 
+        // Re-assert the custom circle from the global mouse hook on every
+        // mouse event (Windows), so apps that set their own cursor — e.g. an
+        // I-beam while typing or a hand while hovering — still show our
+        // circle. Only active in OS mode while the pointer is inside the
+        // region.
+        input::set_forced_cursor(
+            if os_mode && in_region && self.hcursor != 0 {
+                Some(self.hcursor)
+            } else {
+                None
+            },
+        );
+
         if os_mode {
             // OS bitmap cursor (region-limited). On Windows the system cursor
             // bitmaps are swapped with SetSystemCursor while inside the
@@ -791,8 +804,9 @@ impl eframe::App for CursorOverlayApp {
 
 impl Drop for CursorOverlayApp {
     fn drop(&mut self) {
-        // Never leave the system cursor hidden.
+        // Never leave the system cursor hidden or forced.
         self.set_system_cursor_visible(true, true);
+        input::set_forced_cursor(None);
         #[cfg(target_os = "windows")]
         if self.hcursor != 0 {
             // Restore the original system cursors, then free our HCURSOR.

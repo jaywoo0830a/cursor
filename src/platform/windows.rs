@@ -223,24 +223,28 @@ pub fn apply_passthrough(hwnd: usize, passthrough: bool) {
 // ---------------------------------------------------------------------------
 
 /// The system-cursor IDs we replace while the pointer is inside the region,
-/// so apps that switch cursors (I-beam, hand, size arrows, …) still show our
-/// bitmap instead of their own.
+/// so every standard cursor state (arrow, I-beam while typing, hand while
+/// hovering, busy, no-drop, resize arrows, …) shows our circle instead.
 fn ocr_ids() -> &'static [u32] {
     use windows_sys::Win32::UI::WindowsAndMessaging as w;
     &[
-        w::OCR_NORMAL,
-        w::OCR_IBEAM,
-        w::OCR_WAIT,
-        w::OCR_CROSS,
-        w::OCR_UP,
-        w::OCR_SIZEALL,
+        w::OCR_NORMAL,     // arrow
+        w::OCR_IBEAM,      // text / typing
+        w::OCR_WAIT,       // busy
+        w::OCR_CROSS,      // precision select
+        w::OCR_UP,         // up arrow
+        w::OCR_SIZE,       // legacy size
+        w::OCR_ICON,       // legacy icon
+        w::OCR_ICOCUR,     // icon + cursor
+        w::OCR_SIZEALL,    // move
         w::OCR_SIZENWSE,
         w::OCR_SIZENESW,
         w::OCR_SIZEWE,
         w::OCR_SIZENS,
-        w::OCR_HAND,
+        w::OCR_NO,         // no-drop
+        w::OCR_HAND,       // hand / link hover
+        w::OCR_HELP,       // help
         w::OCR_APPSTARTING,
-        w::OCR_NO,
     ]
 }
 

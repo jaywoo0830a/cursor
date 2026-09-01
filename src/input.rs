@@ -157,6 +157,17 @@ pub fn start() -> Option<Receiver<InputEvent>> {
     }
 }
 
+/// Set a cursor handle (`HCURSOR` as `usize`) that the low-level mouse hook
+/// re-asserts on every mouse event, so apps that set their own cursor — e.g.
+/// an I-beam while typing or a hand while hovering — still show our custom
+/// circle. `None` disables forcing.
+pub fn set_forced_cursor(h: Option<usize>) {
+    #[cfg(target_os = "windows")]
+    win::set_forced_cursor(h);
+    #[cfg(not(target_os = "windows"))]
+    let _ = h;
+}
+
 /// Stop the raw-input thread / unhook (called on shutdown).
 pub fn stop() {
     #[cfg(target_os = "windows")]
@@ -196,6 +207,7 @@ mod win {
     static EVENT_TX: OnceLock<Sender<InputEvent>> = OnceLock::new();
     static HOOK: AtomicUsize = AtomicUsize::new(0);
     static LAST_POS: AtomicU64 = AtomicU64::new(0);
+    static FORCED_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
     // HID usage page / usage values for the devices we subscribe to.
     const HID_USAGE_PAGE_GENERIC: u16 = 0x01;
@@ -228,6 +240,10 @@ mod win {
         }
     }
 
+    pub fn set_forced_cursor(h: Option<usize>) {
+        FORCED_CURSOR.store(h.unwrap_or(0), Ordering::Relaxed);
+    }
+
     pub fn last_global_mouse_pos() -> Option<(f64, f64)> {
         let v = LAST_POS.load(Ordering::Relaxed);
         if v == 0 {
@@ -252,9 +268,15 @@ mod win {
     }
 
     /// Global low-level mouse hook: forwards every mouse event with its
-    /// global screen position.
+    /// global screen position, and re-asserts the forced cursor (if any) so
+    /// the app under the pointer cannot show its own I-beam / hand / custom
+    /// cursor.
     unsafe extern "system" fn mouse_ll_hook(code: i32, wparam: usize, lparam: isize) -> isize {
         if code >= 0 {
+            let forced = FORCED_CURSOR.load(Ordering::Relaxed);
+            if forced != 0 {
+                wam::SetCursor(forced as *mut core::ffi::c_void);
+            }
             let m = &*(lparam as *const wam::MSLLHOOKSTRUCT);
             let msg = wparam as u32;
             match msg {
