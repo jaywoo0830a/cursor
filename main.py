@@ -26,7 +26,12 @@ def main() -> int:
     overlay.show()
     overlay.finalize()  # Win32 click-through styles + global hotkey
 
-    return app.exec()
+    try:
+        return app.exec()
+    finally:
+        # Always restore the system / pen cursor when the app exits (including
+        # Ctrl+C in the console).
+        overlay.restore_system_cursor()
 
 
 if __name__ == "__main__":

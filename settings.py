@@ -67,6 +67,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="Keep the native Windows cursor visible under the overlay",
     )
     parser.add_argument(
+        "--no-hide-pen-cursor",
+        action="store_true",
+        help="Do not disable the Windows Ink pen cursor (registry value "
+        "HKCU\\Control Panel\\Cursors\\PenVisualization) while the overlay runs",
+    )
+    parser.add_argument(
         "--no-click-through",
         action="store_true",
         help="Allow clicks to reach the overlay (debugging only)",
@@ -76,4 +82,5 @@ def parse_args(argv=None) -> argparse.Namespace:
     # The native cursor is hidden by default; --show-system-cursor overrides it.
     if args.show_system_cursor:
         args.hide_system_cursor = False
+    args.hide_pen_cursor = not args.no_hide_pen_cursor
     return args
