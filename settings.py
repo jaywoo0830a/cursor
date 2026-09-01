@@ -76,9 +76,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         "HKCU\\Control Panel\\Cursors\\PenVisualization) while the overlay runs",
     )
     parser.add_argument(
-        "--no-click-through",
+        "--click-through",
         action="store_true",
-        help="Allow clicks to reach the overlay (debugging only)",
+        help="Keep the overlay click-through (classic mode). In this mode the "
+        "system cursor cannot be hidden over other applications' windows.",
     )
     args = parser.parse_args(argv)
 
