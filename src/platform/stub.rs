@@ -40,4 +40,6 @@ pub fn init_system_cursor_swap(_custom: usize) -> bool {
 
 pub fn set_system_cursor_active(_active: bool, _custom: usize) {}
 
+pub fn reassert_system_cursor_swap() {}
+
 pub fn restore_system_cursor_swap() {}

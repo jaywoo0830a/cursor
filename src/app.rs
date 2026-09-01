@@ -96,6 +96,9 @@ pub struct CursorOverlayApp {
     /// hysteresis so a brief glitch (e.g. a drawing-pad pen touch) doesn't
     /// disable the forced circle.
     out_region_frames: u32,
+    /// Last time the system-cursor swap was re-asserted (Windows).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    last_swap_reassert: std::time::Instant,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -203,6 +206,7 @@ impl CursorOverlayApp {
             raw_rx,
             raw,
             out_region_frames: 0,
+            last_swap_reassert: std::time::Instant::now(),
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -639,8 +643,19 @@ impl eframe::App for CursorOverlayApp {
         let ctx = ui.ctx().clone();
 
         // ---- drain raw low-level input events (mouse / pen / touch) ----
+        #[cfg_attr(not(target_os = "windows"), allow(unused_variables, unused_assignments, unused_mut))]
+        let mut raw_pointer = false;
         if let Some(rx) = &self.raw_rx {
             while let Ok(ev) = rx.try_recv() {
+                #[cfg(target_os = "windows")]
+                if matches!(
+                    &ev,
+                    InputEvent::Pen { .. }
+                        | InputEvent::Touch { .. }
+                        | InputEvent::Touchpad { .. }
+                ) {
+                    raw_pointer = true;
+                }
                 self.raw.apply(&ev);
             }
         }
@@ -743,6 +758,17 @@ impl eframe::App for CursorOverlayApp {
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
                 platform::set_system_cursor_active(in_region_eff, self.hcursor);
+                // Some tablet drivers revert the system cursors (e.g. via
+                // SPI_SETCURSORS) the instant the pen touches; re-apply the
+                // swap immediately on pen/touch events and periodically so
+                // the circle always comes back.
+                if raw_pointer
+                    || self.last_swap_reassert.elapsed()
+                        >= std::time::Duration::from_millis(250)
+                {
+                    self.last_swap_reassert = std::time::Instant::now();
+                    platform::reassert_system_cursor_swap();
+                }
             }
             if in_region {
                 ctx.set_cursor_image(Some(self.os_cursor.clone()));

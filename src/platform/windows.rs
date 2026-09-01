@@ -334,6 +334,30 @@ pub fn set_system_cursor_active(active: bool, custom: usize) {
     state.active = active;
 }
 
+/// Re-apply the current system-cursor swap (no-op if not active). Use this
+/// periodically because some apps/tablet drivers revert the system cursors
+/// (e.g. via `SPI_SETCURSORS`) — for instance when a drawing-tablet pen
+/// touches — which would otherwise restore the normal arrow.
+pub fn reassert_system_cursor_swap() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CopyIcon, SetSystemCursor};
+    let guard = sys_cursor().lock().unwrap();
+    let Some(state) = guard.as_ref() else {
+        return;
+    };
+    if !state.active {
+        return;
+    }
+    unsafe {
+        for (id, _) in &state.saved {
+            // SetSystemCursor destroys the cursor you pass, so hand it a copy.
+            let copy = CopyIcon(state.custom as *mut core::ffi::c_void);
+            if !copy.is_null() {
+                SetSystemCursor(copy, *id);
+            }
+        }
+    }
+}
+
 /// Restore all system cursors (from the registry) and free our saved copies.
 /// Called on shutdown.
 pub fn restore_system_cursor_swap() {
