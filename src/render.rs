@@ -97,6 +97,7 @@ impl Inner {
         unsafe {
             let hdc = CreateCompatibleDC(std::ptr::null_mut());
             if hdc.is_null() {
+                log::warn!("CreateCompatibleDC failed for overlay surface");
                 return None;
             }
             let (w, h) = (w.max(1), h.max(1));
@@ -117,6 +118,10 @@ impl Inner {
                 0,
             );
             if hbmp.is_null() || bits.is_null() {
+                log::warn!(
+                    "CreateDIBSection failed for overlay surface: {}",
+                    std::io::Error::last_os_error()
+                );
                 DeleteDC(hdc);
                 return None;
             }
@@ -225,7 +230,7 @@ impl Inner {
                 SourceConstantAlpha: 255,
                 AlphaFormat: BLEND_SRC_ALPHA,
             };
-            UpdateLayeredWindow(
+            let ok = UpdateLayeredWindow(
                 self.hwnd as *mut core::ffi::c_void,
                 hdc_dst,
                 &pos,
@@ -236,6 +241,12 @@ impl Inner {
                 &blend,
                 ULW_ALPHA_FLAG,
             );
+            if ok == 0 {
+                log::warn!(
+                    "UpdateLayeredWindow failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
             ReleaseDC(std::ptr::null_mut(), hdc_dst);
         }
     }

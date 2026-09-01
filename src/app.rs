@@ -458,6 +458,7 @@ impl App {
             let Some(target) = self.target_window.clone() else {
                 if self.window_follow_active {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                    self.polish_window();
                     self.window_follow_active = false;
                     self.region_initialized_for_target = false;
                     self.target_hwnd = 0;
@@ -476,6 +477,7 @@ impl App {
             if hwnd == 0 {
                 if self.window_follow_active {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                    self.polish_window();
                     self.window_follow_active = false;
                     self.region_initialized_for_target = false;
                     self.last_target_rect = None;
@@ -487,6 +489,7 @@ impl App {
             if platform::is_iconic(hwnd as *mut core::ffi::c_void) {
                 if self.window_follow_active {
                     window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                    self.polish_window();
                     self.window_follow_active = false;
                     self.region_initialized_for_target = false;
                     self.last_target_rect = None;
@@ -501,6 +504,7 @@ impl App {
                     if !self.window_follow_active {
                         self.window_follow_active = true;
                         window.set_fullscreen(None);
+                        self.polish_window();
                         log::info!("target window found, following rect {rect:?}");
                     }
                     if self.last_target_rect != Some(rect) {
@@ -527,6 +531,7 @@ impl App {
                     self.last_target_rect = None;
                     if self.window_follow_active {
                         window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+                        self.polish_window();
                         self.window_follow_active = false;
                         self.region_initialized_for_target = false;
                         self.win_origin = (0.0, 0.0);
@@ -537,6 +542,14 @@ impl App {
         #[cfg(not(target_os = "windows"))]
         {
             let _ = window;
+        }
+    }
+
+    /// Re-apply the frameless/layered styles after a fullscreen transition.
+    fn polish_window(&self) {
+        #[cfg(target_os = "windows")]
+        if self.native_hwnd != 0 {
+            platform::polish_overlay_window(self.native_hwnd);
         }
     }
 

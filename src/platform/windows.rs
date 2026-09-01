@@ -202,20 +202,38 @@ pub fn apply_passthrough(hwnd: usize, passthrough: bool) {
     }
 }
 
-/// Make the overlay window a proper transparent tool window: ensure
-/// `WS_EX_LAYERED` (for alpha) + `WS_EX_TOOLWINDOW` (no taskbar entry / no
-/// Alt-Tab, so it doesn't look like a normal Win7-style window).
+/// Make the overlay window a bulletproof transparent tool window by forcing
+/// the styles directly (tao's `with_transparent` uses `DwmEnableBlurBehindWindow`
+/// which conflicts with our `UpdateLayeredWindow`, so we do it all here):
+/// * GWL_STYLE  -> `WS_POPUP`, remove caption / thick frame / sys menu / min-max
+/// * GWL_EXSTYLE-> `WS_EX_LAYERED` (per-pixel alpha) + `WS_EX_TOOLWINDOW`
+///                 (no taskbar / Alt-Tab), remove `WS_EX_APPWINDOW`
 pub fn polish_overlay_window(hwnd: usize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE, HWND_TOP,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_CAPTION, WS_EX_APPWINDOW,
+        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+        WS_THICKFRAME,
     };
     unsafe {
         let h = hwnd as *mut core::ffi::c_void;
-        let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
-        SetWindowLongPtrW(
+        let style = GetWindowLongPtrW(h, GWL_STYLE);
+        let style = (style | WS_POPUP as isize)
+            & !(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU)
+                as isize;
+        SetWindowLongPtrW(h, GWL_STYLE, style);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        let ex = (ex | (WS_EX_LAYERED | WS_EX_TOOLWINDOW) as isize) & !(WS_EX_APPWINDOW as isize);
+        SetWindowLongPtrW(h, GWL_EXSTYLE, ex);
+        // Apply the frame change so the OS drops the title bar / border.
+        SetWindowPos(
             h,
-            GWL_EXSTYLE,
-            style | (WS_EX_LAYERED | WS_EX_TOOLWINDOW) as isize,
+            HWND_TOP,
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
         );
     }
 }

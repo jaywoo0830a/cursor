@@ -47,11 +47,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     log::info!("overlaying window matching: {target:?}");
 
-    // Transparent, frameless, always-on-top, fullscreen overlay window.
+    // Transparent, frameless, always-on-top overlay window. NOTE: we do NOT
+    // use `with_transparent(true)` — tao's transparent path uses
+    // `DwmEnableBlurBehindWindow`, which conflicts with our `UpdateLayeredWindow`
+    // transparency. We set `WS_EX_LAYERED` ourselves in polish_overlay_window
+    // and render with per-pixel alpha.
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new()
         .with_title("Custom Cursor Overlay")
-        .with_transparent(true)
         .with_decorations(false)
         .with_always_on_top(true)
         .with_fullscreen(Some(Fullscreen::Borderless(None)))
