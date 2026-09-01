@@ -21,6 +21,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cursor;
 mod input;
 mod platform;
 
@@ -83,6 +84,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // frontend over a custom `local://` protocol.
     let webview = WebViewBuilder::new()
         .with_transparent(true)
+        .with_focused(false)
+        .with_hotkeys_zoom(false)
         .with_url("local://localhost/index.html")
         .with_custom_protocol("local".into(), |_webview_id, _request| {
             Response::builder()

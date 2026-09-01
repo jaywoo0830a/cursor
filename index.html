@@ -5,43 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 <title>Custom Cursor Overlay</title>
 <style>
-  /* ---- reset: fully transparent, no OS cursor ----
-     The window owns the hit-testing inside the region, so `cursor: none`
-     here means the OS draws *no* cursor for this window; our CSS div is the
-     cursor. Outside the region the window is click-through, so the app below
-     shows its own cursor (our CSS doesn't matter there). */
+  /* ---- reset: fully transparent ----
+     The CURSOR is rendered natively by Rust (an OS HCURSOR via SetCursor) —
+     the webview never draws one. We only make sure the webview shows a plain
+     arrow while its UI is interactive, and nothing while the overlay owns the
+     cursor (so WebView2 can't fight the native circle). */
   html, body {
     margin: 0; padding: 0; width: 100%; height: 100%;
     overflow: hidden; background: transparent;
     user-select: none; -webkit-user-select: none;
   }
-  * { cursor: none !important; }
-
-  /* ---- custom CSS cursor (radial-gradient ring + soft shadow + dot) ---- */
-  #cur {
-    position: fixed; left: 0; top: 0; z-index: 999999;
-    width: 22px; height: 22px;
-    pointer-events: none; display: none;
-    will-change: transform;   /* compositor-only moves: no layout/paint per event */
-  }
-  #cur .ring {
-    position: absolute; inset: 0; border-radius: 50%;
-    background: radial-gradient(circle,
-      rgba(255,255,255,0.98) 0%,
-      rgba(255,255,255,0.55) 48%,
-      rgba(120,200,255,0.25) 70%,
-      rgba(120,200,255,0) 100%);
-    box-shadow:
-      0 0 6px rgba(0,0,0,0.45),
-      0 0 14px rgba(0,0,0,0.18);
-  }
-  #cur .dot {
-    position: absolute; left: 50%; top: 50%;
-    width: 3px; height: 3px; margin: -1.5px 0 0 -1.5px;
-    border-radius: 50%;
-    background: #111;
-    box-shadow: 0 0 2px rgba(255,255,255,0.9);
-  }
+  body:not(.owning) { cursor: default; }
+  body.owning, body.owning * { cursor: none !important; }
 
   /* ---- region outline + resize handles ---- */
   #region {
@@ -122,9 +97,6 @@
 </head>
 <body>
 
-  <!-- custom CSS cursor -->
-  <div id="cur"><div class="ring"></div><div class="dot"></div></div>
-
   <!-- overlay region (outline + resize handles) -->
   <div id="region">
     <div class="rh nw" data-dir="nw"></div>
@@ -180,7 +152,6 @@ let state = {
   win: { w: 0, h: 0 },
 };
 const MIN = 24;
-const cur = document.getElementById("cur");
 const regionEl = document.getElementById("region");
 const statusText = document.getElementById("statusText");
 const statusDetail = document.getElementById("statusDetail");
@@ -193,16 +164,6 @@ function send(msg) {
 window.__setState = function (s) {
   state = s; render();
 };
-
-// ---- custom cursor follows the pointer (native events — we own them
-//      inside the region / while editing) ----
-let pointer = { x: -100, y: -100 };
-function onPointer(e) {
-  pointer.x = e.clientX; pointer.y = e.clientY;
-  positionCursor();
-}
-window.addEventListener("pointermove", onPointer, { passive: true });
-window.addEventListener("mousemove", onPointer, { passive: true });
 
 // Pen detection: if a *pen* PointerEvent reaches us, we are stealing the
 // stroke from the app below (window owns hit-testing). Tell Rust so it can
@@ -223,17 +184,6 @@ function penSeen() {
 }
 window.addEventListener("pointermove", (e) => { if (e.pointerType === "pen") penSeen(); });
 window.addEventListener("pointerdown", (e) => { if (e.pointerType === "pen") penSeen(); });
-
-function positionCursor() {
-  // compositor-only: transform (not left/top) so moves don't trigger layout
-  cur.style.transform =
-    "translate3d(" + pointer.x + "px," + pointer.y + "px,0) translate(-50%,-50%)";
-}
-function renderCursor() {
-  const show = state.owning || state.editing || state.settings;
-  cur.style.display = show ? "block" : "none";
-  positionCursor();
-}
 
 // ---- region editor ----
 let drag = null; // { mode, dir, sx, sy, x, y, w, h }
@@ -362,7 +312,7 @@ function reportUiRects() {
 }
 
 function render() {
-  renderCursor();
+  document.body.classList.toggle("owning", state.owning);
   renderRegion();
   renderStatus();
   renderPanel();

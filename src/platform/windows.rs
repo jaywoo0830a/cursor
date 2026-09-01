@@ -1,8 +1,13 @@
 //! Windows implementation of the platform layer: raw Win32 API via
 //! `windows-sys`.
 //!
-//! The cursor itself is rendered by the Chromium webview (pure CSS), so this
-//! layer only provides the native plumbing:
+//! The cursor is rendered **natively in Rust**: we build a real `HCURSOR`
+//! from a Rust-generated bitmap and `SetCursor` it whenever the overlay owns
+//! the hit-testing (non-click-through inside the region). The OS draws it, so
+//! it is smooth, pen-safe (the window owns `WM_SETCURSOR` → apps below can
+//! never override) and visible over DirectComposition.
+//!
+//! Also provides the rest of the native plumbing:
 //! * global cursor position (`GetCursorPos`)
 //! * target-window tracking (`EnumWindows`, `GetWindowRect`)
 //! * click pass-through via `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`)
@@ -29,10 +34,96 @@ pub fn global_cursor_pos() -> Option<(f64, f64)> {
     }
 }
 
-// Cursor rendering moved to the Chromium frontend (pure CSS: the window owns
-// the hit-testing inside the region, so the OS draws the CSS cursor for this
-// window and apps below can never override it — no pen pop-out, works over
-// DirectComposition). No ShowCursor / SetCursor / SetSystemCursor needed.
+/// Create a real `HCURSOR` from straight RGBA pixels (32bpp ARGB DIB +
+/// empty mask). Returns the handle as `usize`, or 0 on failure.
+pub fn create_hcursor_from_rgba(rgba: &[u8], w: u16, h: u16, hot_x: u16, hot_y: u16) -> usize {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+    unsafe {
+        let (w, h) = (w as u32, h as u32);
+        let mut bmi: BITMAPINFO = zeroed();
+        bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        bmi.bmiHeader.biWidth = w as i32;
+        bmi.bmiHeader.biHeight = -(h as i32); // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hbm_color = CreateDIBSection(
+            std::ptr::null_mut(),
+            &bmi,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        );
+        if hbm_color.is_null() || bits.is_null() {
+            return 0;
+        }
+
+        // Copy as premultiplied BGRA (Windows' ARGB cursor format).
+        let n = w as usize * h as usize;
+        let dst = std::slice::from_raw_parts_mut(bits as *mut u8, n * 4);
+        for (i, px) in rgba.chunks_exact(4).take(n).enumerate() {
+            let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+            dst[i * 4 + 0] = (b * a / 255) as u8;
+            dst[i * 4 + 1] = (g * a / 255) as u8;
+            dst[i * 4 + 2] = (r * a / 255) as u8;
+            dst[i * 4 + 3] = a as u8;
+        }
+
+        // 1bpp mask, all zeros (alpha comes from the color DIB).
+        let mask_row_bytes = ((w + 31) / 32) * 4;
+        let mask = vec![0u8; (mask_row_bytes as usize) * h as usize];
+        let hbm_mask = CreateBitmap(w as i32, h as i32, 1, 1, mask.as_ptr().cast());
+        if hbm_mask.is_null() {
+            DeleteObject(hbm_color);
+            return 0;
+        }
+
+        let info = ICONINFO {
+            fIcon: 0, // cursor, not icon
+            xHotspot: hot_x as u32,
+            yHotspot: hot_y as u32,
+            hbmMask: hbm_mask,
+            hbmColor: hbm_color,
+        };
+        let hcursor = CreateIconIndirect(&info);
+        DeleteObject(hbm_color);
+        DeleteObject(hbm_mask);
+        hcursor as usize
+    }
+}
+
+/// Set the OS cursor to our custom handle (`Some(h)`) or the default arrow
+/// (`None`). Called while the overlay owns the hit-testing so the OS draws
+/// our circle for this window (re-asserted every frame/tick).
+pub fn set_cursor_handle(hcursor: Option<usize>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_ARROW};
+    unsafe {
+        let h = match hcursor {
+            Some(h) if h != 0 => h as *mut core::ffi::c_void,
+            _ => LoadCursorW(std::ptr::null_mut(), IDC_ARROW) as *mut core::ffi::c_void,
+        };
+        SetCursor(h);
+    }
+}
+
+/// Destroy a cursor created with [`create_hcursor_from_rgba`].
+pub fn destroy_cursor(hcursor: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::DestroyCursor;
+    if hcursor != 0 {
+        unsafe {
+            DestroyCursor(hcursor as *mut core::ffi::c_void);
+        }
+    }
+}
 /// Find a visible, non-minimized top-level window whose title contains
 /// `sub` (case-insensitive). Returns its `HWND`, or `None`.
 pub fn find_window_by_title(sub: &str) -> Option<HWND> {

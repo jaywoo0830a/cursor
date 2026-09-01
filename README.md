@@ -1,50 +1,54 @@
-# Custom Cursor Overlay — Chromium(WebView2) + Rust
+# Custom Cursor Overlay — Rust 중심 (tao + wry/WebView2)
 
-초경량 커스텀 커서 오버레이: **순수 CSS로 그린 커서**를 최상위 투명 창이 소유합니다.
-Rust(`tao` + `wry`) 코어가 창/입력/Win32를 담당하고, 커서는 내장 Chromium(Windows의
-WebView2)이 **CSS로만** 렌더링합니다. 네트워크 없이 완전 오프라인으로 동작합니다.
+초경량 커스텀 커서 오버레이: **커서는 Rust가 네이티브로 렌더링**(OS `HCURSOR` +
+`SetCursor`)하고, 최상위 투명 창이 영역 안 히트테스트를 소유합니다. Chromium
+(WebView2)은 **설정/상태/영역 편집용 얇은 UI 껍데기**로만 쓰입니다 — 커서는
+웹뷰와 무관하므로 JS 커서 루프에 의한 렉이 없습니다. 네트워크 없이 완전 오프라인.
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│ Rust 코어 (tao + wry)                                       │
-│  · 창: 투명 · 프레임리스 · 항상 위 · 전체화면 (WebView2=Chromium)│
+│ Rust 코어 (tao + wry + Win32) — 커서·입력·판정 전부 여기      │
+│  · 커서: Rust 생성 비트맵 → HCURSOR → SetCursor (OS가 그림)   │
+│    → 매끄럽고, DirectComposition 위에도, 펜에도 안전          │
+│  · 창: 투명 · 프레임리스 · 항상 위 · 전체화면 (WebView2)       │
 │  · Win32: raw input(WH_MOUSE_LL + WM_INPUT)                 │
 │    대상창 찾기·추종 / 영역 판정 / 패스스루(WS_EX_TRANSPARENT)  │
 │    아래 앱 입력 포워딩(PostMessage + ScreenToClient)          │
-│  · IPC(JSON): 상태 → 프론트, 명령 ← 프론트                    │
+│  · IPC(JSON): 상태 → 프론트(UI용), 명령 ← 프론트              │
 └──────────────────────────┬─────────────────────────────────┘
-                           │ IPC
+                           │ IPC (UI만)
 ┌──────────────────────────▼─────────────────────────────────┐
-│ Chromium 프론트 (index.html — 순수 CSS/JS, 오프라인 내장)      │
-│  · 커스텀 CSS 커서 (radial-gradient 링 + 섀도 + 점)            │
-│  · 영역 편집기(드래그/리사이즈) + 설정 패널 + 상태바            │
+│ Chromium 프론트 (index.html — 얇은 UI, 오프라인 내장)          │
+│  · 상태바 · 설정 패널 · 영역 편집기(드래그/리사이즈)             │
+│  · 커서는 그리지 않음 (owning 중엔 cursor:none, Rust가 원을 그림)│
 └────────────────────────────────────────────────────────────┘
 ```
 
-## 왜 Chromium인가? (펜 팝아웃의 근본 해결)
+## 왜 이 방식이 펜 팝아웃을 해결하나
 
-egui 방식은 커서를 자체 GL 표면에 *그려서* 띄우기 때문에, 펜(Windows Ink/OTD)이
+egui 방식은 커서를 자체 GL 표면에 *그려서* 띄웠기 때문에, 펜(Windows Ink/OTD)이
 터치할 때 아래 앱/드라이버가 만드는 커서와 쟁탈전이 벌어져 기본 커서가 튀어나왔습니다.
 
-Chromium 창은 그렇지 않습니다. **영역 안에서는 이 창이 히트테스트를 소유**(비클릭통과)
-하므로 `WM_SETCURSOR`를 독점하고, CSS `cursor: none`으로 OS가 이 창의 커서를 아예
-그리지 않습니다. 따라서 **펜이 터치해도 기본 커서가 절대 나타나지 않고**, OS 커서
+이 방식은 **영역 안에서 이 창이 히트테스트를 소유**(비클릭통과) → `WM_SETCURSOR`를
+독점 → 아래 앱이 절대 커서를 덮어쓸 수 없습니다. 그리고 커서는 **Rust가 만든 OS
+HCURSOR**를 `SetCursor`로 지정하므로 OS가 그 창의 커서로 우리 원을 직접 그립니다
+(웹뷰/JS 무관). 따라서 **펜이 터치해도 기본 커서가 절대 나타나지 않고**, OS 커서
 자체를 대체하므로 DirectComposition/GPU 캔버스 위에서도 항상 보입니다.
 
 ## 동작 원리 (파이프라인)
 
-1. **캡처** — `WH_MOUSE_LL` 훅이 모든 마우스 이벤트를 전역에서 가로챕니다. 펜
-   (Windows Ink/OTD)은 합성 마우스 메시지를 내보내므로 훅이 함께 잡아 펜 필기도
+1. **캡처 (Rust)** — `WH_MOUSE_LL` 훅이 모든 마우스 이벤트를 전역에서 가로챕니다.
+   펜(Windows Ink/OTD)은 합성 마우스 메시지를 내보내므로 훅이 함께 잡아 펜 필기도
    포워딩됩니다. 고주파 상대 델타/펜/터치는 `WM_INPUT` raw input으로 별도 캡처.
 2. **판정 (Rust)** — 전역 포인터가 영역 안이면 `owning`(창이 커서 소유), 밖이면
    `passthrough`(클릭통과). 영역 경계에서 `WS_EX_TRANSPARENT`를 자동 토글.
    **펜 활성 시에는 항상 `passthrough`** — 마우스 전용 포워딩은 Windows Ink
    펜(WISP/WM_POINTER)을 재현할 수 없으므로, 펜이 쓰이는 동안은 창이 클릭통과가
-   되어 아래 앱이 진짜 펜 스트로크를 직접 받습니다. (프론트가 `pointerType==='pen'`
-   이벤트 또는 raw HID Pen 이벤트로 감지 → 1.2초 디케이)
-3. **렌더 (Chromium)** — `owning` 상태면 프론트가 CSS 커서 div를 그립니다.
-   (프론트는 네이티브 `pointermove`를 받으므로 IPC 지연 없이 커서 추적 —
-   `transform`만 갱신해 레이아웃/페인트 없이 합성기에서 이동)
+   되어 아래 앱이 진짜 펜 스트로크를 직접 받습니다. (raw HID Pen 이벤트 또는
+   프론트 `pointerType==='pen'` 이벤트로 감지 → 1.2초 디케이)
+3. **커서 (Rust)** — `owning` 상태면 Rust가 `SetCursor(우리 HCURSOR)`를 매 틱마다
+   재단언 → OS가 우리 원을 그림. 웹뷰는 owning 중 `cursor:none`이라 간섭하지 않음.
+   JS 커서 루프가 없어 렉 원인이 제거됩니다. (UI 모드에선 웹뷰 기본 화살표)
 4. **포워딩 (Rust)** — 오버레이가 입력을 가로챘으므로 `forward_mouse`가
    `PostMessageW`(ScreenToClient 좌표 + 버튼 다운 시 SetForegroundWindow)로
    아래 창에 재생성 메시지를 보내 정상 동작하게 합니다. 프론트 UI(상태바/패널)
@@ -83,12 +87,13 @@ cargo build --release
 ```
 src/
   main.rs              tao 이벤트 루프 + wry WebView + IPC 배선
-  app.rs               상태 머신: 영역/대상창/owning·passthrough 판정
+  app.rs               상태 머신: 영역/대상창/owning·passthrough/네이티브 커서
+  cursor.rs            순수 Rust 커서 비트맵 생성 (링 + 점, 안티앨리어스)
   input.rs             raw input 캡처 (WH_MOUSE_LL + WM_INPUT, ~1ms 디바운스)
   platform/
-    windows.rs         GetCursorPos / 대상창 추적 / WS_EX_TRANSPARENT / 포워딩
+    windows.rs         HCURSOR 생성/SetCursor / 대상창 추적 / WS_EX_TRANSPARENT / 포워딩
     stub.rs            비 Windows no-op
-index.html             Chromium 프론트 (CSS 커서, 영역 편집기, 설정 UI) — 완전 내장
+index.html             얇은 UI 껍데기 (상태바·설정·영역 편집) — 커서 없음
 ```
 
 ## 종속성

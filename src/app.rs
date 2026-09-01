@@ -1,13 +1,15 @@
 //! Core application state: region, target-window tracking, and the
-//! cursor-owning / pass-through decision that drives the Chromium frontend.
+//! cursor-owning / pass-through decision.
 //!
-//! The cursor itself is rendered by the webview in pure CSS. What Rust owns
-//! here is the *decision* about who gets the input / cursor:
+//! The cursor is rendered **natively in Rust** (an OS `HCURSOR` built from a
+//! Rust-generated bitmap, applied with `SetCursor` while we own the
+//! hit-testing). The Chromium webview is only a thin UI layer (status bar,
+//! settings panel, region editor) and never draws the cursor.
 //!
 //! * inside the region the overlay window is **non-click-through** — it owns
 //!   the hit-testing (and therefore `WM_SETCURSOR`), so the app below can
 //!   never override the cursor (no pen pop-out, works over DirectComposition)
-//!   and the CSS cursor is shown. All pointer input is then forwarded to the
+//!   and the OS draws our circle. All pointer input is then forwarded to the
 //!   app below (`platform::forward_mouse`).
 //! * outside the region the overlay is **click-through** (`WS_EX_TRANSPARENT`)
 //!   — the app below keeps its own cursor and input.
@@ -17,6 +19,7 @@
 //! The frontend is a *view*: it renders whatever [`App::tick`] reports and
 //! sends editing commands back through [`App::handle_ipc`].
 
+use crate::cursor;
 use crate::input::{self, InputEvent, InputSnapshot};
 use crate::platform;
 use std::sync::mpsc::Receiver;
@@ -66,6 +69,9 @@ pub struct App {
 
     // --- window / coordinates ---
     native_hwnd: usize,
+    /// Native `HCURSOR` (our circle) applied with `SetCursor` while owning.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    hcursor: usize,
     scale: f32,
     win_w: f32,
     win_h: f32,
@@ -112,6 +118,15 @@ impl App {
             window_follow_active: false,
             region_initialized_for_target: false,
             native_hwnd: 0,
+            #[cfg(target_os = "windows")]
+            hcursor: {
+                // Build our reticle as a real OS cursor (Rust-drawn, OS shows
+                // it whenever we own the hit-testing).
+                let (rgba, hot) = cursor::make_cursor_bitmap(32);
+                platform::create_hcursor_from_rgba(&rgba, 32, 32, hot[0], hot[1])
+            },
+            #[cfg(not(target_os = "windows"))]
+            hcursor: 0,
             scale: 1.0,
             win_w: 0.0,
             win_h: 0.0,
@@ -261,6 +276,16 @@ impl App {
                 })
                 .collect();
             platform::set_forward_block_rects(&phys);
+        }
+
+        // Native cursor (Rust): while we own the hit-testing, make the OS draw
+        // our circle (re-asserted each tick so the webview's `cursor: none`
+        // can't override it). Otherwise we leave the cursor alone — the webview
+        // shows its default arrow for the UI, and outside the region the app
+        // below owns the cursor.
+        #[cfg(target_os = "windows")]
+        if owning {
+            platform::set_cursor_handle(Some(self.hcursor));
         }
 
         if self.force_push {
@@ -517,5 +542,10 @@ impl Drop for App {
         // Disable input forwarding so no replay happens after teardown.
         #[cfg(target_os = "windows")]
         platform::set_forwarding(false, 0);
+        // Free our native cursor.
+        #[cfg(target_os = "windows")]
+        if self.hcursor != 0 {
+            platform::destroy_cursor(self.hcursor);
+        }
     }
 }
