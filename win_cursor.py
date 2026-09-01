@@ -119,15 +119,24 @@ def restore_pen_cursor_visualization(value: int) -> None:
 
 
 def _broadcast_setting_change() -> None:
-    """Tell the shell a user setting changed so it re-reads the value."""
-    user32 = _user32()
-    user32.SendMessageTimeoutW.argtypes = (
-        ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t,
-        ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_size_t),
-    )
-    user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
-    payload = ctypes.create_unicode_buffer("Cursors")
-    lp = ctypes.cast(payload, ctypes.c_ssize_t)
-    user32.SendMessageTimeoutW(
-        HWND_BROADCAST, WM_SETTINGCHANGE, 0, lp, SMTO_ABORTIFHUNG, 200, None
-    )
+    """Tell the shell a user setting changed so it re-reads the value.
+
+    Best-effort only: never raises -- the registry value is the source of
+    truth, so a broadcast failure must not break cursor hiding.
+    """
+    try:
+        user32 = _user32()
+        user32.SendMessageTimeoutW.argtypes = (
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_uint, ctypes.POINTER(ctypes.c_size_t),
+        )
+        user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
+        payload = ctypes.create_unicode_buffer("Cursors")
+        # cast() requires a pointer type as its second argument.
+        user32.SendMessageTimeoutW(
+            HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+            ctypes.cast(payload, ctypes.c_void_p),
+            SMTO_ABORTIFHUNG, 200, None,
+        )
+    except Exception:
+        pass
