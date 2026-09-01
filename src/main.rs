@@ -170,6 +170,26 @@ mod platform {
         use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
         unsafe { IsIconic(hwnd) != 0 }
     }
+
+    /// Force click pass-through on/off by directly toggling the window's
+    /// `WS_EX_TRANSPARENT` style. This is a direct fallback on top of
+    /// winit's own mechanism (`set_cursor_hittest`), for setups where the
+    /// winit path is unreliable. `WS_EX_LAYERED` is kept for transparency.
+    pub fn apply_passthrough(hwnd: usize, passthrough: bool) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+        };
+        unsafe {
+            let h = hwnd as *mut core::ffi::c_void;
+            let style = GetWindowLongPtrW(h, GWL_EXSTYLE);
+            let new_style = if passthrough {
+                style | (WS_EX_TRANSPARENT | WS_EX_LAYERED) as isize
+            } else {
+                style & !(WS_EX_TRANSPARENT as isize)
+            };
+            SetWindowLongPtrW(h, GWL_EXSTYLE, new_style);
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -192,6 +212,8 @@ mod platform {
     pub fn is_iconic(_hwnd: *mut core::ffi::c_void) -> bool {
         false
     }
+
+    pub fn apply_passthrough(_hwnd: usize, _passthrough: bool) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -224,24 +246,49 @@ fn load_cursor_bitmap() -> CursorBitmap {
     make_default_cursor()
 }
 
-/// Rasterize a small circular cursor (white fill, dark ring), hotspot at the
-/// center, so it stays readable on both light and dark backgrounds.
+/// Rasterize a modern, small precision-reticle cursor (32x32, anti-aliased):
+/// a thin white ring with dark outlines and a small dark center dot, hotspot
+/// at the center. Reads well on both light and dark backgrounds.
 fn make_default_cursor() -> CursorBitmap {
     const S: usize = 32;
     const CX: f32 = (S as f32 - 1.0) * 0.5; // 15.5
     const CY: f32 = (S as f32 - 1.0) * 0.5;
-    const R_INNER: f32 = 10.5; // white fill
-    const R_OUTER: f32 = 15.0; // dark outline
+    const AA: f32 = 1.0;
+
+    // Radii (in px) of the reticle design:
+    const R_DOT: f32 = 2.2; // dark center dot (aiming point)
+    const R_RING_IN: f32 = 8.0; // white ring (inner)
+    const R_RING_OUT: f32 = 9.8; // white ring (outer)
+    const R_OUT_OUT: f32 = 10.8; // dark outline (outer side of the ring)
+
+    // Coverage of the annulus [a, b] with 1px anti-aliased edges.
+    let band = |d: f32, a: f32, b: f32| -> f32 {
+        let inner = ((d - a) / AA + 0.5).clamp(0.0, 1.0);
+        let outer = ((b - d) / AA + 0.5).clamp(0.0, 1.0);
+        inner.min(outer)
+    };
 
     let mut rgba = vec![0u8; S * S * 4];
     for y in 0..S {
         for x in 0..S {
             let d = ((x as f32 - CX).powi(2) + (y as f32 - CY).powi(2)).sqrt();
-            let i = (y * S + x) * 4;
-            if d <= R_INNER {
-                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
-            } else if d <= R_OUTER {
-                rgba[i..i + 4].copy_from_slice(&[20, 20, 20, 255]);
+            // Center dot is a filled circle (full alpha in the middle).
+            let dot = ((R_DOT - d) / AA + 0.5).clamp(0.0, 1.0);
+            let ring = band(d, R_RING_IN, R_RING_OUT);
+            let out = band(d, R_RING_OUT, R_OUT_OUT);
+
+            let dark = dot.max(out);
+            let white = ring;
+            let a = dark.max(white);
+            if a > 0.0 {
+                let v = (20.0 * dark + 255.0 * white) / a; // dark dot/outline, white ring
+                let i = (y * S + x) * 4;
+                rgba[i..i + 4].copy_from_slice(&[
+                    v.round() as u8,
+                    v.round() as u8,
+                    v.round() as u8,
+                    (a * 255.0).round() as u8,
+                ]);
             }
         }
     }
@@ -320,6 +367,9 @@ struct CursorOverlayApp {
     region_initialized_for_target: bool,
     /// Whether the region was initialized to the full screen on the first frame.
     region_initialized: bool,
+    /// Our own native window handle (HWND), used to force pass-through.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    native_hwnd: usize,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -356,6 +406,22 @@ impl CursorOverlayApp {
             .map(|w| w[1].clone());
         let target_window_input = target_window.clone().unwrap_or_default();
 
+        // Grab our own native window handle (Windows) so we can force click
+        // pass-through directly with SetWindowLong as a fallback.
+        #[cfg(target_os = "windows")]
+        let native_hwnd = {
+            use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+            cc.winit_window()
+                .and_then(|w| w.window_handle().ok())
+                .and_then(|h| match h.as_raw() {
+                    RawWindowHandle::Win32(wh) => Some(wh.hwnd.get() as usize),
+                    _ => None,
+                })
+                .unwrap_or(0)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let native_hwnd = 0;
+
         Self {
             ctx,
             bitmap,
@@ -367,7 +433,10 @@ impl CursorOverlayApp {
             show_settings: false,
             editing: false,
             enabled: true,
-            use_os_cursor: true, // OS bitmap cursor image is the reliable default
+            // Painted cursor by default so click pass-through works. Toggle
+            // "Use OS bitmap cursor image" for the ultra-reliable OS cursor
+            // (which requires pass-through to be off).
+            use_os_cursor: false,
             show_region_visual: false,
             // Click pass-through is only implemented on Windows (global
             // cursor polling via GetCursorPos).
@@ -384,6 +453,7 @@ impl CursorOverlayApp {
             window_follow_active: false,
             region_initialized_for_target: false,
             region_initialized: false,
+            native_hwnd,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -821,6 +891,10 @@ impl eframe::App for CursorOverlayApp {
         if self.last_passthrough != Some(passthrough) {
             self.last_passthrough = Some(passthrough);
             ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
+            #[cfg(target_os = "windows")]
+            if self.native_hwnd != 0 {
+                platform::apply_passthrough(self.native_hwnd, passthrough);
+            }
         }
 
         // ---- pointer position ----
