@@ -27,7 +27,6 @@ mod config;
 mod cursor;
 mod input;
 mod platform;
-mod pointer_filter;
 
 use eframe::egui::viewport::ViewportBuilder;
 

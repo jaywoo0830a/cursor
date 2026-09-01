@@ -18,20 +18,16 @@ apps below (Windows). Outside the region the normal system cursor is used.
 - **Modern precision-reticle cursor** (anti-aliased): a thin ring with a dark
   outline and a small center dot, hotspot at the center. Replace it with your
   own bitmap via `assets/cursor.png`.
-- **OS bitmap cursor by default** — Windows draws the cursor itself, so it is
-  visible over *any* app, including GPU/DirectComposition canvases such as
-  PDF viewers where the system cursor would otherwise be covered or
-  overridden. On Windows the *system cursor bitmaps* (**all** `OCR_*` ids:
-  arrow, I-beam, hand, busy, no-drop, resize arrows, …) are swapped with our
-  circle via `SetSystemCursor` while the pointer is inside the region, so
-  **every cursor state stays a circle** — even while typing (I-beam) or
-  hovering (hand) — and it now works **together with click pass-through**.
-  The global `WH_MOUSE_LL` hook also re-asserts the circle on every mouse
-  event, defeating apps that set their own *custom* cursors.
-- **Click pass-through (both modes):** clicks pass through the overlay to the
-  apps below — either with the OS bitmap cursor (system cursor swap) or with
-  the egui-painted cursor (`ShowCursor` hiding). Enforced directly with
-  `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`).
+- **Blocks the system cursor (root cause fix)** — inside the region the OS
+  cursor is **fully hidden** (`ShowCursor` pushed well below 0, re-enforced
+  by a dedicated high-frequency guard thread) and our circle is **painted**
+  on the topmost layer instead. Because the system cursor simply does not
+  exist while the pointer is in the region, no other process or driver can
+  make it "pop out" — whatever they call `SetCursor`/`SetSystemCursor` with
+  is invisible. This is what makes pen/tablet writing (OTD, Windows Ink)
+  flicker-free.
+- **Click pass-through:** clicks pass through the overlay to the apps below.
+  Enforced directly with `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`).
 - **Low-level raw input (Windows):** a background thread runs its own Win32
   message loop and captures, via raw Win32 API (`windows-sys`):
   * **Mouse** — a global `WH_MOUSE_LL` hook (move / buttons / wheel with
@@ -66,16 +62,13 @@ While the settings panel is closed, a small status line is drawn at the top
 left of the screen:
 
 ```
-F1 settings · Esc quit   |   cursor:IMG · pass:ON · region:IN · in:pen
+F1 settings · Esc quit   |   pass:ON · region:IN · in:pen
 ```
 
-`cursor:IMG` = OS bitmap cursor (default, reliable, works with pass-through),
-`cursor:PAINT` = egui-painted cursor, `pass` = click pass-through on,
-`region` = whether the mouse is currently inside the overlay region,
-`in` = last raw input device seen (mouse / pen / touch / touchpad). Use it to
-verify the logic: if `region:IN` is shown but no circle appears, it is a
-rendering issue; if it always says `OUT`, the pointer/region coordinates are
-misaligned.
+`pass` = click pass-through on, `region` = whether the mouse is currently
+inside the overlay region, `in` = last raw input device seen (mouse / pen /
+touch / touchpad). Inside the region the system cursor is hidden and our
+circle is painted; outside it the normal system cursor is used.
 
 ## Build & run
 
@@ -119,22 +112,16 @@ fullscreen. This uses only standard Windows APIs (`EnumWindows`,
    polled with `GetCursorPos` and converted from physical pixels to points;
    otherwise `Context::pointer_interact_pos` is used.
 3. If the pointer is inside the configured `region` (and the overlay is
-   active):
-   - the system cursor is hidden — via `ShowCursor(FALSE)` in click-through
-     mode, or `ctx.set_cursor_icon(CursorIcon::None)` otherwise — and
-   - the custom bitmap cursor is painted at the pointer position on a top
-     layer (`Painter::image`), offset by its hotspot.
-4. Outside the region the system cursor is restored (`ShowCursor(TRUE)` /
-   `CursorIcon::Default` / `SetSystemCursor` swap back).
-5. Native OS mode: `ctx.set_cursor_image(Some(CustomCursorImage { .. }))`
-   registers the RGBA bitmap as a real OS cursor (`egui::CustomCursorImage`),
-   and on Windows the system cursor bitmaps are swapped with `SetSystemCursor`
-   while the pointer is inside the region. Because the bitmap lives in the
-   *system* cursor, it works over any app **and** together with click
-   pass-through.
-6. Raw input: a background thread runs a Win32 message loop (`WH_MOUSE_LL`
+   active): the system cursor is **hidden** (`ShowCursor` pushed well below
+   0 and kept there by a high-frequency guard thread, so apps/drivers
+   cannot re-show it) and the custom bitmap cursor is **painted** at the
+   pointer position on a top layer (`Painter::image`), offset by its
+   hotspot.
+4. Outside the region (or while the settings panel is open) the system
+   cursor is restored (`ShowCursor(TRUE)` / `CursorIcon::Default`).
+5. Raw input: a background thread runs a Win32 message loop (`WH_MOUSE_LL`
    hook + `RegisterRawInputDevices`/`WM_INPUT`) and pushes mouse / pen /
-   touch / trackpad events to the app every frame.
+   touch / trackpad events (debounced ~1 ms) to the app every frame.
 
 Key egui 0.36 APIs used:
 
@@ -172,15 +159,14 @@ automatically (`make_default_cursor` in `src/cursor.rs`).
   the overlay uses `GetCursorPos` to track the mouse (the window receives no
   pointer events) and `ShowCursor(FALSE/TRUE)` to hide/show the system cursor
   (winit's per-window cursor API is ignored for pass-through windows). The
-  `ShowCursor` calls are paired so Windows' global display counter stays
-  balanced, and the cursor is always restored on exit.
+  `ShowCursor` counter is pushed well below 0 so apps can't easily re-show
+  the cursor, and it is always restored on exit.
 - Transparency requires a compositor on Linux/X11 (e.g. picom, Mutter), and
   works with both the glow and wgpu backends on Windows.
-- The OS bitmap cursor mode is **region-limited** on Windows: the system
-  cursor bitmaps are swapped with `SetSystemCursor` while the pointer is
-  inside the region and restored outside it. While active it replaces those
-  system cursors *globally* (the cursor bitmap shown inside the region is
-  the same everywhere, because there is only one system cursor).
+- The painted circle is drawn inside our topmost transparent window, so it is
+  invisible over rare GPU/DirectComposition hardware-overlay canvases (some
+  PDF viewers) — the system cursor is still hidden there, so use mouse
+  pass-through and the app's own cursor in that case.
 - The HID pen/touch/trackpad report decode in `src/input.rs` is best-effort:
   Windows HID digitizer layouts vary by device, so use the raw report bytes
   (`InputEvent::HidRaw`) as the authoritative source if needed.

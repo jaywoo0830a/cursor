@@ -9,7 +9,6 @@ use eframe::egui::{
 use crate::config::{default_region, HANDLE_SIZE, MIN_REGION, CURSOR_DISPLAY_SIZE};
 use crate::cursor::{self, CursorBitmap};
 use crate::input::{self, InputEvent, InputSnapshot};
-use crate::pointer_filter::{PenSignal, PointerFilter};
 #[cfg(target_os = "windows")]
 use crate::platform;
 
@@ -38,7 +37,6 @@ pub struct CursorOverlayApp {
     ctx: egui::Context,
     bitmap: CursorBitmap,
     texture: TextureHandle,
-    os_cursor: egui::CustomCursorImage,
 
     /// The overlay region, in window (screen) points.
     region: Rect,
@@ -50,9 +48,6 @@ pub struct CursorOverlayApp {
     editing: bool,
     /// Master switch for the custom-cursor behavior.
     enabled: bool,
-    /// Use the native OS-level bitmap cursor (whole window) instead of the
-    /// region-limited painted cursor. Only used without click pass-through.
-    use_os_cursor: bool,
     /// Draw the faint blue region outline while the overlay is active.
     show_region_visual: bool,
     /// Click pass-through (Windows only): clicks go to the apps below and the
@@ -95,25 +90,8 @@ pub struct CursorOverlayApp {
 
     /// Consecutive frames the pointer was outside the region. Used for
     /// hysteresis so a brief glitch (e.g. a drawing-pad pen touch) doesn't
-    /// disable the forced circle.
+    /// disable the hidden/painted cursor.
     out_region_frames: u32,
-    /// Last time the system-cursor swap was re-asserted (Windows, ~2 Hz
-    /// safety net while hovering).
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    last_swap_reassert: std::time::Instant,
-    /// Whether the pen was active last frame (to re-assert the swap when it
-    /// becomes idle again).
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    was_pen_active: bool,
-    /// Pointer-source state machine: detects pen-related states and the
-    /// pen-involving transition moments so the system cursor never pops out.
-    pointer_filter: PointerFilter,
-    /// While the pen is in use (hovering or touching), hide the OS cursor
-    /// entirely and paint our circle instead — no competition, no flicker.
-    hide_cursor_with_pen: bool,
-    /// How long to keep suppressing the system cursor after a pen-involving
-    /// change (default 3000 ms).
-    pen_hold_ms: u32,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -134,12 +112,6 @@ impl CursorOverlayApp {
             ),
             TextureOptions::NEAREST,
         );
-
-        let os_cursor = egui::CustomCursorImage {
-            rgba: bitmap.rgba.clone(),
-            size: bitmap.size,
-            hotspot: bitmap.hotspot,
-        };
 
         // Optional CLI: --window "<title substring>" overlays a specific
         // window instead of the whole screen.
@@ -185,8 +157,7 @@ impl CursorOverlayApp {
         let raw = InputSnapshot::default();
 
         // Start the high-frequency cursor guard (Windows): continuously
-        // re-asserts our circle (or keeps it hidden while writing) so no
-        // other process/driver can take the cursor over.
+        // re-hides the system cursor while the overlay is active.
         #[cfg(target_os = "windows")]
         platform::start_cursor_guard();
 
@@ -194,18 +165,12 @@ impl CursorOverlayApp {
             ctx,
             bitmap,
             texture,
-            os_cursor,
             region: default_region(),
             // Start with the overlay active: no settings panel and no region
             // outline — just the transparent background and the cursor.
             show_settings: false,
             editing: false,
             enabled: true,
-            // OS bitmap cursor by default: Windows draws the cursor itself
-            // (and we can swap the system cursors), so it shows over any app
-            // — including GPU/DirectComposition canvases like PDF viewers —
-            // AND it now works together with click pass-through.
-            use_os_cursor: true,
             show_region_visual: false,
             // Click pass-through is only implemented on Windows (global
             // cursor polling via GetCursorPos).
@@ -227,11 +192,6 @@ impl CursorOverlayApp {
             raw_rx,
             raw,
             out_region_frames: 0,
-            last_swap_reassert: std::time::Instant::now(),
-            was_pen_active: false,
-            pointer_filter: PointerFilter::new(),
-            hide_cursor_with_pen: true,
-            pen_hold_ms: 3000,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -344,31 +304,19 @@ impl CursorOverlayApp {
         ctx.pointer_interact_pos()
     }
 
-    /// Hide/show the OS cursor. With click-through enabled we must use the
-    /// global `ShowCursor` API (winit's per-window cursor is ignored for
-    /// transparent/pass-through windows). The calls are paired to keep
-    /// Windows' display counter balanced.
-    fn set_system_cursor_visible(&mut self, passthrough: bool, visible: bool) {
-        #[cfg(target_os = "windows")]
-        {
-            if passthrough {
-                if !visible {
-                    // Re-apply every frame: other windows (e.g. a PDF
-                    // viewer) may re-show the cursor in between.
-                    platform::set_system_cursor_visible(false);
-                    self.cursor_hidden = true;
-                } else if self.cursor_hidden {
-                    platform::set_system_cursor_visible(true);
-                    self.cursor_hidden = false;
-                }
-            } else if self.cursor_hidden {
-                // Left click-through mode; make sure the cursor is restored.
-                platform::set_system_cursor_visible(true);
-                self.cursor_hidden = false;
-            }
+    /// Hide/show the OS cursor. Windows' `ShowCursor` uses a global display
+    /// counter; `platform::set_system_cursor_visible(false)` pushes it deep
+    /// below 0 so a handful of `ShowCursor(TRUE)` calls by apps cannot re-show
+    /// the cursor between frames.
+    #[cfg(target_os = "windows")]
+    fn hide_cursor(&mut self, hide: bool) {
+        if hide {
+            platform::set_system_cursor_visible(false);
+            self.cursor_hidden = true;
+        } else if self.cursor_hidden {
+            platform::set_system_cursor_visible(true);
+            self.cursor_hidden = false;
         }
-        #[cfg(not(target_os = "windows"))]
-        let _ = (passthrough, visible);
     }
 
     /// Overlay a specific target window (Windows): resize the overlay to
@@ -520,46 +468,15 @@ impl CursorOverlayApp {
 
                 ui.checkbox(&mut self.enabled, "Enable custom cursor");
                 ui.checkbox(&mut self.editing, "Edit region (drag / resize)");
-                ui.checkbox(&mut self.use_os_cursor, "Use OS bitmap cursor image")
-                    .on_hover_text(
-                        "Registers the cursor bitmap as a real OS cursor and, on\n\
-                         Windows, swaps the system cursor bitmaps (SetSystemCursor)\n\
-                         while the pointer is inside the region. The OS draws it, so\n\
-                         it shows over any app (GPU/DirectComposition canvases like\n\
-                         PDF viewers). Works together with click pass-through.",
-                    );
                 ui.checkbox(&mut self.show_region_visual, "Show region outline");
                 #[cfg(target_os = "windows")]
                 ui.checkbox(&mut self.passthrough, "Click pass-through (mouse)")
                     .on_hover_text(
                         "Clicks pass through the overlay to the apps below.\n\
-                         Works with both the OS bitmap cursor (system cursor\n\
-                         swap) and the painted cursor. Uses global cursor\n\
-                         tracking (GetCursorPos / raw input hook).",
+                         Inside the region the system cursor is fully hidden\n\
+                         and the circle is painted instead — no other process\n\
+                         or driver can show it. Uses global cursor tracking.",
                     );
-                #[cfg(target_os = "windows")]
-                ui.checkbox(&mut self.hide_cursor_with_pen, "Hide system cursor while using pen")
-                    .on_hover_text(
-                        "While the pen is in use (hovering or writing), the OS\n\
-                         cursor is fully hidden and the circle is painted\n\
-                         instead, so the tablet driver/app cannot take it over\n\
-                         or make it flicker — in any pen state.",
-                    );
-                #[cfg(target_os = "windows")]
-                ui.horizontal(|ui| {
-                    ui.label("Pen suppression hold:");
-                    ui.add(
-                        egui::Slider::new(&mut self.pen_hold_ms, 500..=5000)
-                            .suffix(" ms")
-                            .logarithmic(true),
-                    )
-                    .on_hover_text(
-                        "How long to keep the system cursor suppressed after\n\
-                         any pen-related change (down/up, side button, device\n\
-                         switch). Longer = fewer pop-outs, at the cost of a\n\
-                         longer painted-circle tail after you switch to mouse.",
-                    );
-                });
                 ui.separator();
 
                 // ---- overlay a specific window (Windows) ----
@@ -635,8 +552,7 @@ impl CursorOverlayApp {
                         "mouse:  ({:.0}, {:.0})   rawΔ: ({}, {})  wheel: {}\n\
                          pen:    {}  barrel:{} eraser:{}  pressure {:.2}\n\
                          touch:  {}   touchpad: {}\n\
-                         device: {}   HID reports: {}\n\
-                         source: {:?}   suppress: {}  hold:{}  boost:{}",
+                         device: {}   HID reports: {}",
                         self.raw.mouse.0,
                         self.raw.mouse.1,
                         self.raw.raw_delta.0,
@@ -654,10 +570,6 @@ impl CursorOverlayApp {
                         if pad { "active" } else { "none" },
                         self.raw.last_device,
                         self.raw.hid_reports,
-                        self.pointer_filter.state(),
-                        self.pointer_filter.state().is_pen(),
-                        self.pointer_filter.in_hold(),
-                        self.pointer_filter.in_boost(),
                     ));
                     ui.weak(
                         "Pen / touch / trackpad are captured raw via HID raw input\n\
@@ -696,42 +608,11 @@ impl eframe::App for CursorOverlayApp {
         let ctx = ui.ctx().clone();
 
         // ---- drain raw low-level input events (mouse / pen / touch) ----
-        let mut frame_pen = false;
-        let mut frame_mouse = false;
-        let mut frame_pad = false;
         if let Some(rx) = &self.raw_rx {
             while let Ok(ev) = rx.try_recv() {
-                match &ev {
-                    InputEvent::Pen { .. } => frame_pen = true,
-                    InputEvent::Touch { .. } | InputEvent::Touchpad { .. } => frame_pad = true,
-                    InputEvent::MouseMove { .. }
-                    | InputEvent::MouseButton { .. }
-                    | InputEvent::MouseWheel { .. }
-                    | InputEvent::RawMouse { .. } => frame_mouse = true,
-                    _ => {}
-                }
                 self.raw.apply(&ev);
             }
         }
-        // Feed the pointer-source state machine. It returns true whenever the
-        // pointer is in a pen state OR right after a pen-involving transition
-        // (pen down↔up, pen↔mouse, pen↔pad …) — the moments the system cursor
-        // tends to pop out.
-        let pen_signal = if frame_pen {
-            self.raw.pen.map(|c| PenSignal {
-                down: c.down,
-                in_range: c.in_range,
-                barrel: c.barrel,
-                eraser: c.eraser,
-            })
-        } else {
-            None
-        };
-        // Apply the (configurable) suppression-hold duration, then feed the
-        // state machine above. We call set_hold every frame: it is idempotent.
-        self.pointer_filter
-            .set_hold(self.pen_hold_ms.saturating_mul(60) / 1000);
-        let pen_suppress = self.pointer_filter.update(pen_signal, frame_mouse, frame_pad);
 
         // ---- keyboard shortcuts ----
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
@@ -755,21 +636,12 @@ impl eframe::App for CursorOverlayApp {
         self.update_target_window(&ctx);
 
         // ---- overlay mode ----
-        // Two ways to show the custom cursor:
-        //  * OS bitmap cursor (default): a real OS cursor image registered
-        //    with `Context::set_cursor_image` (winit `CustomCursor`), plus on
-        //    Windows the *system* cursor bitmaps are swapped with
-        //    `SetSystemCursor` while the pointer is inside the region. The OS
-        //    draws it, so it is visible regardless of our rendering — and,
-        //    unlike before, it now works together with click pass-through.
-        //  * Painted cursor: drawn by egui on the topmost layer. Supports
-        //    click pass-through on Windows (the system cursor is hidden
-        //    per-region via ShowCursor and the position is polled via
-        //    GetCursorPos).
-        // While the settings panel or region editor is open, the overlay is
-        // paused and the normal system cursor is used.
+        // 원천 차단 방식: 오버레이가 활성이고 포인터가 영역 안이면 시스템 커서를
+        // 완전히 숨기고(심층 카운터 + 고빈도 가드) 우리 원을 직접 그린다. 어떤
+        // 프로세스/드라이버가 SetCursor/SetSystemCursor를 호출해도 시스템 커서는
+        // 보이지 않으므로 "점령"이 무의미해진다. 영역 밖 또는 설정창이 열려 있으면
+        // 정상 시스템 커서를 복원한다.
         let overlay_on = self.enabled && !self.editing && !self.show_settings;
-        let os_mode = self.use_os_cursor && overlay_on;
 
         #[cfg(target_os = "windows")]
         let passthrough = self.passthrough && overlay_on;
@@ -809,119 +681,39 @@ impl eframe::App for CursorOverlayApp {
         }
         let in_region_eff = self.out_region_frames < 3;
 
-        // While the pointer is in a pen state (down or hovering) — or right
-        // after a pen-involving transition — inside the region, the OS cursor
-        // is fully hidden and our circle is painted instead (see the os_mode
-        // branch below): no cursor competition, no flicker, in any pen state
-        // or transition.
-        let pen_active =
-            self.hide_cursor_with_pen && os_mode && in_region_eff && pen_suppress;
-
-        // High-frequency guard: keep our circle showing (or keep it hidden
-        // while the pen is in use) so no other process/driver can take the
-        // cursor over — even between render frames. Right after a pen
-        // transition we ask it to run at boosted frequency.
+        // High-frequency guard: continuously re-hide the system cursor while
+        // the overlay is active inside the region, so no other process or
+        // driver can ever show it in between frames.
         #[cfg(target_os = "windows")]
-        platform::set_cursor_guard(
-            if os_mode && in_region_eff && !pen_active && self.hcursor != 0 {
-                self.hcursor
-            } else {
-                0
-            },
-            pen_active,
-            self.pointer_filter.in_boost(),
-        );
+        platform::set_cursor_guard(overlay_on && in_region_eff);
 
-        if os_mode {
-            // OS bitmap cursor (region-limited). On Windows the system cursor
-            // bitmaps are swapped with SetSystemCursor while inside the
-            // region, which the OS draws over ANY app and which works with
-            // click pass-through. A direct SetCursor is also re-applied every
-            // frame so an app (e.g. a PDF viewer's canvas) cannot override us.
+        if overlay_on && in_region_eff {
+            // 영역 안: 시스템 커서 숨김 + 우리 원 그림.
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
-                if pen_active {
-                    // 원천 봉쇄: 펜 사용 중(호버든 필기든)에는 OS 커서를 완전히
-                    // 숨겨서 드라이버/앱이 아무리 커서를 바꿔도 깜빡일 수 없게
-                    // 한다 (우리 원은 아래에서 직접 그림). 교체/재적용도 중단해
-                    // CPU를 아낀다.
-                    platform::set_system_cursor_visible(false);
-                    self.cursor_hidden = true;
-                } else {
-                    if self.cursor_hidden {
-                        platform::set_system_cursor_visible(true);
-                        self.cursor_hidden = false;
-                    }
-                    // Pen use just ended: the driver may have reverted the
-                    // system cursors while it was hidden — re-apply once so
-                    // the circle is back immediately.
-                    if self.was_pen_active {
-                        platform::reassert_system_cursor_swap();
-                    }
-                    platform::set_system_cursor_active(in_region_eff, self.hcursor);
-                    // Low-cost safety net (~2 Hz): if anything reverts the
-                    // swap while hovering, the circle returns within 500 ms.
-                    if in_region_eff
-                        && self.last_swap_reassert.elapsed()
-                            >= std::time::Duration::from_millis(500)
-                    {
-                        self.last_swap_reassert = std::time::Instant::now();
-                        platform::reassert_system_cursor_swap();
-                    }
-                }
+                self.hide_cursor(true);
+                // 백업: 만에 하나 커서가 잠깐 보여도 우리 원이 되도록 교체 유지.
+                platform::set_system_cursor_active(true, self.hcursor);
             }
-            if pen_active {
-                // OS 커서는 숨겼으니 그 자리에 우리 원을 직접 그려 표시한다.
-                if let Some(p) = pointer {
-                    self.paint_custom_cursor(&ctx, p);
-                }
-                ctx.set_cursor_icon(CursorIcon::None);
-                ctx.set_cursor_image(None);
-                #[cfg(target_os = "windows")]
-                platform::set_cursor_handle(None);
-            } else {
-                if in_region {
-                    ctx.set_cursor_image(Some(self.os_cursor.clone()));
-                    #[cfg(target_os = "windows")]
-                    platform::set_cursor_handle(Some(self.hcursor));
-                } else {
-                    ctx.set_cursor_image(None);
-                    #[cfg(target_os = "windows")]
-                    platform::set_cursor_handle(None);
-                }
-                ctx.set_cursor_icon(CursorIcon::Default);
-            }
-        } else if overlay_on && passthrough {
-            // Painted cursor with click pass-through (Windows): hide the
-            // system cursor only inside the region and draw ours.
-            if in_region {
-                self.set_system_cursor_visible(true, false); // ShowCursor(FALSE)
-                if let Some(p) = pointer {
-                    self.paint_custom_cursor(&ctx, p);
-                }
-            } else {
-                self.set_system_cursor_visible(true, true); // ShowCursor(TRUE)
-            }
-        } else if overlay_on && in_region {
-            // Painted cursor without click pass-through (fallback).
-            ctx.set_cursor_icon(CursorIcon::None);
             if let Some(p) = pointer {
                 self.paint_custom_cursor(&ctx, p);
             }
-            self.set_system_cursor_visible(false, true);
+            ctx.set_cursor_icon(CursorIcon::None);
+            ctx.set_cursor_image(None);
+            #[cfg(target_os = "windows")]
+            platform::set_cursor_handle(None);
         } else {
-            // Overlay paused or pointer outside the region: normal cursor.
+            // 영역 밖 또는 오버레이 일시정지: 시스템 커서 복원.
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
+                self.hide_cursor(false);
                 platform::set_system_cursor_active(false, self.hcursor);
             }
             ctx.set_cursor_icon(CursorIcon::Default);
             ctx.set_cursor_image(None);
-            self.set_system_cursor_visible(false, true); // restore OS cursor
+            #[cfg(target_os = "windows")]
+            platform::set_cursor_handle(None);
         }
-
-        // Remember the pen-active state for the idle-transition next frame.
-        self.was_pen_active = pen_active;
 
         // ---- live status line (lets you verify what the overlay is doing) ----
         if !self.show_settings {
@@ -931,12 +723,10 @@ impl eframe::App for CursorOverlayApp {
                 format!(" · in:{}", self.raw.last_device)
             };
             let status = format!(
-                "F1 settings · Esc quit   |   cursor:{} · pass:{} · region:{}{}{}",
-                if os_mode { "IMG" } else { "PAINT" },
+                "F1 settings · Esc quit   |   pass:{} · region:{}{}",
                 if passthrough { "ON" } else { "off" },
                 if in_region { "IN" } else { "OUT" },
                 device,
-                if pen_active { " · pen" } else { "" },
             );
             let painter = ctx.debug_painter();
             painter.text(
@@ -961,7 +751,8 @@ impl eframe::App for CursorOverlayApp {
 impl Drop for CursorOverlayApp {
     fn drop(&mut self) {
         // Never leave the system cursor hidden.
-        self.set_system_cursor_visible(true, true);
+        #[cfg(target_os = "windows")]
+        platform::set_system_cursor_visible(true);
         #[cfg(target_os = "windows")]
         if self.hcursor != 0 {
             // Restore the original system cursors, then free our HCURSOR.

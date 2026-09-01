@@ -10,7 +10,7 @@
 //! * click pass-through via `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`)
 //! * target-window tracking (`EnumWindows`, `GetWindowRect`)
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// A Windows window handle (`HWND`).
@@ -340,30 +340,6 @@ pub fn set_system_cursor_active(active: bool, custom: usize) {
     state.active = active;
 }
 
-/// Re-apply the current system-cursor swap (no-op if not active). Use this
-/// periodically because some apps/tablet drivers revert the system cursors
-/// (e.g. via `SPI_SETCURSORS`) — for instance when a drawing-tablet pen
-/// touches — which would otherwise restore the normal arrow.
-pub fn reassert_system_cursor_swap() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CopyIcon, SetSystemCursor};
-    let guard = sys_cursor().lock().unwrap();
-    let Some(state) = guard.as_ref() else {
-        return;
-    };
-    if !state.active {
-        return;
-    }
-    unsafe {
-        for (id, _) in &state.saved {
-            // SetSystemCursor destroys the cursor you pass, so hand it a copy.
-            let copy = CopyIcon(state.custom as *mut core::ffi::c_void);
-            if !copy.is_null() {
-                SetSystemCursor(copy, *id);
-            }
-        }
-    }
-}
-
 /// Restore all system cursors (from the registry) and free our saved copies.
 /// Called on shutdown.
 pub fn restore_system_cursor_swap() {
@@ -407,9 +383,7 @@ pub fn restore_system_cursor_swap() {
 
 static GUARD_STARTED: AtomicBool = AtomicBool::new(false);
 static GUARD_STOP: AtomicBool = AtomicBool::new(false);
-static GUARD_FORCE: AtomicUsize = AtomicUsize::new(0);
 static GUARD_HIDE: AtomicBool = AtomicBool::new(false);
-static GUARD_BOOST: AtomicBool = AtomicBool::new(false);
 
 /// Start the high-frequency cursor-guard thread.
 pub fn start_cursor_guard() {
@@ -423,15 +397,11 @@ pub fn start_cursor_guard() {
         .ok();
 }
 
-/// Update the guard's desired state (called every frame):
-/// * `force` — our `HCURSOR` (as `usize`) to keep showing, or 0.
-/// * `hide`  — keep the OS cursor hidden (e.g. while writing).
-/// * `boost` — run at a higher frequency (right after a pen transition) so
-///   any app/driver that briefly takes the cursor over is beaten back faster.
-pub fn set_cursor_guard(force: usize, hide: bool, boost: bool) {
-    GUARD_FORCE.store(force, Ordering::Relaxed);
+/// Update the guard's desired state (called every frame): keep the OS cursor
+/// fully hidden (`hide` = true) or idle (`hide` = false). It continuously
+/// re-hides it so no app/driver can show it in between frames.
+pub fn set_cursor_guard(hide: bool) {
     GUARD_HIDE.store(hide, Ordering::Relaxed);
-    GUARD_BOOST.store(boost, Ordering::Relaxed);
 }
 
 fn cursor_guard_loop() {
@@ -441,25 +411,12 @@ fn cursor_guard_loop() {
         windows_sys::Win32::Media::timeBeginPeriod(1);
     }
     let period = std::time::Duration::from_millis(1);
-    let boost_period = std::time::Duration::from_micros(200);
     while !GUARD_STOP.load(Ordering::SeqCst) {
-        // During a boost window (right after a pen transition) tick much
-        // more often so we win the contention race decisively.
-        let boosted = GUARD_BOOST.load(Ordering::Relaxed);
-        std::thread::sleep(if boosted { boost_period } else { period });
+        std::thread::sleep(period);
         if GUARD_HIDE.load(Ordering::Relaxed) {
             // Keep the OS cursor hidden (deep counter) even if an app or
             // driver re-shows it in between.
             set_system_cursor_visible(false);
-        } else {
-            let force = GUARD_FORCE.load(Ordering::Relaxed);
-            if force != 0 {
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(
-                        force as *mut core::ffi::c_void,
-                    );
-                }
-            }
         }
     }
     unsafe {
@@ -470,7 +427,5 @@ fn cursor_guard_loop() {
 /// Stop the cursor guard (called on shutdown).
 pub fn stop_cursor_guard() {
     GUARD_STOP.store(true, Ordering::SeqCst);
-    GUARD_FORCE.store(0, Ordering::Relaxed);
     GUARD_HIDE.store(false, Ordering::Relaxed);
-    GUARD_BOOST.store(false, Ordering::Relaxed);
 }
