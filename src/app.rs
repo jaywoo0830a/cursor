@@ -100,16 +100,15 @@ pub struct CursorOverlayApp {
     /// safety net while hovering).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     last_swap_reassert: std::time::Instant,
-    /// Whether the pen was writing last frame (to re-assert the swap on the
-    /// pen-up transition).
+    /// Whether the pen was active last frame (to re-assert the swap when it
+    /// becomes idle again).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    was_writing: bool,
-    /// Consecutive frames the pen has been lifted while in writing mode
-    /// (hysteresis against contact-bit jitter near the touch threshold).
-    pen_up_frames: u32,
-    /// While the pen is down (writing), hide the OS cursor entirely and paint
-    /// our circle instead — this blocks cursor flicker at the source.
-    hide_cursor_while_writing: bool,
+    was_pen_active: bool,
+    /// Last time a pen event arrived (activity-based "pen in use" detection).
+    last_pen_event: std::time::Instant,
+    /// While the pen is in use (hovering or touching), hide the OS cursor
+    /// entirely and paint our circle instead — no competition, no flicker.
+    hide_cursor_with_pen: bool,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -224,9 +223,9 @@ impl CursorOverlayApp {
             raw,
             out_region_frames: 0,
             last_swap_reassert: std::time::Instant::now(),
-            was_writing: false,
-            pen_up_frames: 0,
-            hide_cursor_while_writing: true,
+            was_pen_active: false,
+            last_pen_event: std::time::Instant::now(),
+            hide_cursor_with_pen: true,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -533,11 +532,12 @@ impl CursorOverlayApp {
                          tracking (GetCursorPos / raw input hook).",
                     );
                 #[cfg(target_os = "windows")]
-                ui.checkbox(&mut self.hide_cursor_while_writing, "Hide cursor while writing (pen)")
+                ui.checkbox(&mut self.hide_cursor_with_pen, "Hide system cursor while using pen")
                     .on_hover_text(
-                        "While the pen is down (writing), the OS cursor is\n\
-                         fully hidden and the circle is painted instead, so\n\
-                         the tablet driver/app cannot make it flicker.",
+                        "While the pen is in use (hovering or writing), the OS\n\
+                         cursor is fully hidden and the circle is painted\n\
+                         instead, so the tablet driver/app cannot take it over\n\
+                         or make it flicker — in any pen state.",
                     );
                 ui.separator();
 
@@ -672,6 +672,10 @@ impl eframe::App for CursorOverlayApp {
         // ---- drain raw low-level input events (mouse / pen / touch) ----
         if let Some(rx) = &self.raw_rx {
             while let Ok(ev) = rx.try_recv() {
+                // Track the last pen event for activity-based pen detection.
+                if matches!(&ev, InputEvent::Pen { .. }) {
+                    self.last_pen_event = std::time::Instant::now();
+                }
                 self.raw.apply(&ev);
             }
         }
@@ -752,38 +756,35 @@ impl eframe::App for CursorOverlayApp {
         }
         let in_region_eff = self.out_region_frames < 3;
 
-        // Pen contact can jitter near the touch threshold ("just barely
-        // touching"), which would toggle the writing mode and make the cursor
-        // flicker between hidden/painted and the swapped circle. Add
-        // hysteresis: once writing, stay writing until the pen has been
-        // lifted for a few frames.
-        let pen_down = self.raw.pen.is_some_and(|c| c.down);
-        if pen_down {
-            self.pen_up_frames = 0;
-        } else {
-            self.pen_up_frames = self.pen_up_frames.saturating_add(1);
-        }
+        // "Pen in use" = the pen is hovering (in range) or touching (down).
+        // It is activity-based: a pen event within the last ~0.8 s counts as
+        // in use, so a stale in-range flag can't keep the system cursor
+        // hidden forever (a short pause returns to normal).
+        let pen_in_use = self.raw.pen.is_some_and(|c| c.in_range || c.down);
+        let pen_recent =
+            self.last_pen_event.elapsed() < std::time::Duration::from_millis(800);
 
-        // While the pen is down inside the region we "write" with it. To
-        // block the cursor flicker at the source, the OS cursor is fully
-        // hidden during writing and our circle is painted instead (see the
-        // os_mode branch below) — no cursor re-assertion fights while writing.
-        let pen_writing = self.hide_cursor_while_writing
+        // While the pen is in use inside the region — down OR hovering — the
+        // OS cursor is fully hidden and our circle is painted instead (see
+        // the os_mode branch below): no cursor competition, no flicker, in
+        // any pen state.
+        let pen_active = self.hide_cursor_with_pen
             && os_mode
             && in_region_eff
-            && (pen_down || self.pen_up_frames < 3);
+            && pen_recent
+            && pen_in_use;
 
         // High-frequency guard: keep our circle showing (or keep it hidden
-        // while writing) so no other process/driver can take the cursor over
-        // — even between render frames.
+        // while the pen is in use) so no other process/driver can take the
+        // cursor over — even between render frames.
         #[cfg(target_os = "windows")]
         platform::set_cursor_guard(
-            if os_mode && in_region_eff && !pen_writing && self.hcursor != 0 {
+            if os_mode && in_region_eff && !pen_active && self.hcursor != 0 {
                 self.hcursor
             } else {
                 0
             },
-            pen_writing,
+            pen_active,
         );
 
         if os_mode {
@@ -794,10 +795,11 @@ impl eframe::App for CursorOverlayApp {
             // frame so an app (e.g. a PDF viewer's canvas) cannot override us.
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
-                if pen_writing {
-                    // 원천 봉쇄: 필기 중에는 OS 커서를 완전히 숨겨서 드라이버/앱이
-                    // 아무리 커서를 바꿔도 깜빡일 수 없게 한다 (우리 원은 아래에서
-                    // 직접 그림). 커서 교체/재적용도 중단해 CPU를 아낀다.
+                if pen_active {
+                    // 원천 봉쇄: 펜 사용 중(호버든 필기든)에는 OS 커서를 완전히
+                    // 숨겨서 드라이버/앱이 아무리 커서를 바꿔도 깜빡일 수 없게
+                    // 한다 (우리 원은 아래에서 직접 그림). 교체/재적용도 중단해
+                    // CPU를 아낀다.
                     platform::set_system_cursor_visible(false);
                     self.cursor_hidden = true;
                 } else {
@@ -805,10 +807,10 @@ impl eframe::App for CursorOverlayApp {
                         platform::set_system_cursor_visible(true);
                         self.cursor_hidden = false;
                     }
-                    // Writing just ended: the driver may have reverted the
+                    // Pen use just ended: the driver may have reverted the
                     // system cursors while it was hidden — re-apply once so
                     // the circle is back immediately.
-                    if self.was_writing {
+                    if self.was_pen_active {
                         platform::reassert_system_cursor_swap();
                     }
                     platform::set_system_cursor_active(in_region_eff, self.hcursor);
@@ -823,7 +825,7 @@ impl eframe::App for CursorOverlayApp {
                     }
                 }
             }
-            if pen_writing {
+            if pen_active {
                 // OS 커서는 숨겼으니 그 자리에 우리 원을 직접 그려 표시한다.
                 if let Some(p) = pointer {
                     self.paint_custom_cursor(&ctx, p);
@@ -873,8 +875,8 @@ impl eframe::App for CursorOverlayApp {
             self.set_system_cursor_visible(false, true); // restore OS cursor
         }
 
-        // Remember the writing state for the pen-up transition next frame.
-        self.was_writing = pen_writing;
+        // Remember the pen-active state for the idle-transition next frame.
+        self.was_pen_active = pen_active;
 
         // ---- live status line (lets you verify what the overlay is doing) ----
         if !self.show_settings {
@@ -889,7 +891,7 @@ impl eframe::App for CursorOverlayApp {
                 if passthrough { "ON" } else { "off" },
                 if in_region { "IN" } else { "OUT" },
                 device,
-                if pen_writing { " · write" } else { "" },
+                if pen_active { " · pen" } else { "" },
             );
             let painter = ctx.debug_painter();
             painter.text(
