@@ -74,24 +74,30 @@ If the file is absent, a default arrow cursor is generated automatically.
 
 ## Notes & limitations
 
-- eframe 0.36.1 defaults to the **wgpu** renderer. On machines without a
-  working Vulkan/EGL driver you may see EGL init warnings or a black window.
-  To use the classic OpenGL backend instead, disable wgpu and enable glow:
+- **Windows crash fix (0xc0000005 / STATUS_ACCESS_VIOLATION):** egui/eframe
+  0.36 defaults to the **wgpu** renderer, which crashes at startup on some
+  Windows GPUs/drivers (see [emilk/egui#3686](https://github.com/emilk/egui/issues/3686)).
+  This project therefore defaults to the **glow (OpenGL)** backend via the
+  `renderer` option and the `glow` cargo feature. You can switch the backend
+  at runtime:
 
-  ```toml
-  [dependencies]
-  eframe = { version = "0.36.1", default-features = false,
-             features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+  ```bash
+  cargo run --release                 # default: glow (OpenGL)
+  cargo run --release -- --backend glow
+  cargo run --release --features wgpu -- --backend wgpu   # wgpu backend
   ```
 
-  and set `renderer: eframe::Renderer::Glow` in `NativeOptions`.
+  To change the compile-time default, edit the `[features]` section in
+  `Cargo.toml` (`default = ["glow"]` → `default = ["glow", "wgpu"]` or
+  `default = ["wgpu"]`).
 - The overlay window captures pointer input over the whole screen (a winit
   window cannot receive pointer events in only a sub-rectangle). To make
   clicks pass through to the underlying apps you would combine
   `ViewportBuilder::with_mouse_passthrough(true)` with an OS-level global
   pointer tracker (e.g. X11 `XQueryPointer` / `enigo`), since with
   passthrough enabled the window no longer receives pointer events.
-- Transparency requires a compositor on Linux/X11 (e.g. picom, Mutter).
+- Transparency requires a compositor on Linux/X11 (e.g. picom, Mutter), and
+  works with both the glow and wgpu backends on Windows.
 - The OS-level bitmap cursor mode (`use_os_cursor`) applies to the entire
   window, not only the region — that is a limitation of the OS cursor API.
 - The example was built with rustc 1.98.0; egui 0.36.1 needs rustc ≥ 1.95.

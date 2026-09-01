@@ -4,8 +4,21 @@ version = "0.1.0"
 edition = "2021"
 description = "Overlay that shows only a custom cursor inside a user-defined region, built with egui 0.36 / eframe 0.36"
 
+# Rendering backends.
+#
+# egui/eframe 0.36 defaults to the wgpu renderer, which can crash at startup
+# with `0xc0000005` (STATUS_ACCESS_VIOLATION) on some Windows GPUs/drivers
+# (see https://github.com/emilk/egui/issues/3686). We therefore default to
+# the glow (OpenGL) backend, which is also the recommended backend for
+# transparent windows. To use wgpu instead, enable the `wgpu` feature and
+# run with `--backend wgpu`.
+[features]
+default = ["glow"]
+glow = ["eframe/glow"]
+wgpu = ["eframe/wgpu"]
+
 [dependencies]
-eframe = "0.36.1"
+eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "default_fonts", "links", "wayland", "x11", "web_screen_reader"] }
 egui = "0.36.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"

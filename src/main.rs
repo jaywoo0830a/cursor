@@ -516,10 +516,65 @@ impl eframe::App for CursorOverlayApp {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Pick the rendering backend from `--backend glow|wgpu` (default: glow).
+///
+/// wgpu is eframe's default backend but is known to crash with
+/// `STATUS_ACCESS_VIOLATION` (`0xc0000005`) at startup on some Windows
+/// machines (https://github.com/emilk/egui/issues/3686), so we prefer the
+/// glow (OpenGL) backend. To use wgpu, enable the `wgpu` cargo feature and
+/// pass `--backend wgpu`.
+fn select_renderer() -> eframe::Renderer {
+    let backend = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--backend")
+        .map(|w| w[1].to_ascii_lowercase());
+
+    match backend.as_deref() {
+        Some("glow") => {
+            #[cfg(feature = "glow")]
+            {
+                return eframe::Renderer::Glow;
+            }
+            #[cfg(not(feature = "glow"))]
+            eprintln!("warning: the glow backend is not compiled; enable the `glow` feature");
+        }
+        Some("wgpu") => {
+            #[cfg(feature = "wgpu")]
+            {
+                return eframe::Renderer::Wgpu;
+            }
+            #[cfg(not(feature = "wgpu"))]
+            eprintln!(
+                "warning: the wgpu backend is not compiled; enable the `wgpu` feature \
+                 (cargo run --features wgpu)"
+            );
+        }
+        Some(other) => {
+            eprintln!("warning: unknown backend {other:?} (expected \"glow\" or \"wgpu\")");
+        }
+        None => {}
+    }
+
+    // Default: glow when available, otherwise wgpu.
+    #[cfg(feature = "glow")]
+    {
+        eframe::Renderer::Glow
+    }
+    #[cfg(not(feature = "glow"))]
+    {
+        eframe::Renderer::Wgpu
+    }
+}
+
 fn main() -> eframe::Result {
     env_logger::init();
 
+    let renderer = select_renderer();
+    log::info!("Using the {renderer:?} renderer");
+
     let native_options = eframe::NativeOptions {
+        renderer,
         viewport: ViewportBuilder::default()
             .with_app_id("custom_cursor_overlay")
             .with_title("Custom Cursor Overlay")
