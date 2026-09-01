@@ -107,6 +107,105 @@ mod platform {
         }
     }
 
+    // ---- custom cursor HCURSOR (force over any app) ----
+
+    /// Create a real `HCURSOR` from straight RGBA pixels (32bpp ARGB DIB +
+    /// empty mask). Returns the handle as `usize`, or 0 on failure.
+    pub fn create_hcursor_from_rgba(
+        rgba: &[u8],
+        w: u16,
+        h: u16,
+        hot_x: u16,
+        hot_y: u16,
+    ) -> usize {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+
+        unsafe {
+            let (w, h) = (w as u32, h as u32);
+            let mut bmi: BITMAPINFO = zeroed();
+            bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+            bmi.bmiHeader.biWidth = w as i32;
+            bmi.bmiHeader.biHeight = -(h as i32); // top-down
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+            let hbm_color = CreateDIBSection(
+                std::ptr::null_mut(),
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
+            if hbm_color.is_null() || bits.is_null() {
+                return 0;
+            }
+
+            // Copy as premultiplied BGRA (Windows' ARGB cursor format).
+            let n = w as usize * h as usize;
+            let dst = std::slice::from_raw_parts_mut(bits as *mut u8, n * 4);
+            for (i, px) in rgba.chunks_exact(4).take(n).enumerate() {
+                let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
+                dst[i * 4 + 0] = (b * a / 255) as u8;
+                dst[i * 4 + 1] = (g * a / 255) as u8;
+                dst[i * 4 + 2] = (r * a / 255) as u8;
+                dst[i * 4 + 3] = a as u8;
+            }
+
+            // 1bpp mask, all zeros (alpha comes from the color DIB).
+            let mask_row_bytes = ((w + 31) / 32) * 4;
+            let mask = vec![0u8; (mask_row_bytes as usize) * h as usize];
+            let hbm_mask = CreateBitmap(w as i32, h as i32, 1, 1, mask.as_ptr().cast());
+            if hbm_mask.is_null() {
+                DeleteObject(hbm_color);
+                return 0;
+            }
+
+            let info = ICONINFO {
+                fIcon: 0, // cursor, not icon
+                xHotspot: hot_x as u32,
+                yHotspot: hot_y as u32,
+                hbmMask: hbm_mask,
+                hbmColor: hbm_color,
+            };
+            let hcursor = CreateIconIndirect(&info);
+            DeleteObject(hbm_color);
+            DeleteObject(hbm_mask);
+            hcursor as usize
+        }
+    }
+
+    /// Set the system cursor to our custom handle (`Some`) or the default
+    /// arrow (`None`). Re-asserting this every frame overrides any cursor an
+    /// app (e.g. a PDF viewer's canvas) sets in between.
+    pub fn set_cursor_handle(hcursor: Option<usize>) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_ARROW};
+        unsafe {
+            let h = match hcursor {
+                Some(h) if h != 0 => h as *mut core::ffi::c_void,
+                _ => LoadCursorW(std::ptr::null_mut(), IDC_ARROW) as *mut core::ffi::c_void,
+            };
+            SetCursor(h);
+        }
+    }
+
+    /// Destroy a cursor created with [`create_hcursor_from_rgba`].
+    pub fn destroy_cursor(hcursor: usize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::DestroyCursor;
+        if hcursor != 0 {
+            unsafe {
+                DestroyCursor(hcursor as *mut core::ffi::c_void);
+            }
+        }
+    }
+
     // ---- target window tracking (overlay a specific process's window) ----
 
     /// A Windows window handle (`HWND`).
@@ -214,6 +313,20 @@ mod platform {
     }
 
     pub fn apply_passthrough(_hwnd: usize, _passthrough: bool) {}
+
+    pub fn create_hcursor_from_rgba(
+        _rgba: &[u8],
+        _w: u16,
+        _h: u16,
+        _x: u16,
+        _y: u16,
+    ) -> usize {
+        0
+    }
+
+    pub fn set_cursor_handle(_hcursor: Option<usize>) {}
+
+    pub fn destroy_cursor(_hcursor: usize) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +483,10 @@ struct CursorOverlayApp {
     /// Our own native window handle (HWND), used to force pass-through.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     native_hwnd: usize,
+    /// A real Windows `HCURSOR` created from the cursor bitmap, used to force
+    /// the custom cursor over any app.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    hcursor: usize,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -422,6 +539,19 @@ impl CursorOverlayApp {
         #[cfg(not(target_os = "windows"))]
         let native_hwnd = 0;
 
+        // Build a real Windows HCURSOR so we can force the custom circle
+        // over any app (e.g. a PDF viewer's canvas) that sets its own cursor.
+        #[cfg(target_os = "windows")]
+        let hcursor = platform::create_hcursor_from_rgba(
+            &bitmap.rgba,
+            bitmap.size[0],
+            bitmap.size[1],
+            bitmap.hotspot[0],
+            bitmap.hotspot[1],
+        );
+        #[cfg(not(target_os = "windows"))]
+        let hcursor = 0;
+
         Self {
             ctx,
             bitmap,
@@ -433,10 +563,11 @@ impl CursorOverlayApp {
             show_settings: false,
             editing: false,
             enabled: true,
-            // Painted cursor by default so click pass-through works. Toggle
-            // "Use OS bitmap cursor image" for the ultra-reliable OS cursor
-            // (which requires pass-through to be off).
-            use_os_cursor: false,
+            // OS bitmap cursor by default: Windows draws the cursor itself,
+            // so it shows over any app (including GPU/DirectComposition
+            // canvases like PDF viewers) and we re-assert it every frame.
+            // Toggle it off for the painted cursor + click pass-through.
+            use_os_cursor: true,
             show_region_visual: false,
             // Click pass-through is only implemented on Windows (global
             // cursor polling via GetCursorPos).
@@ -454,6 +585,7 @@ impl CursorOverlayApp {
             region_initialized_for_target: false,
             region_initialized: false,
             native_hwnd,
+            hcursor,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -572,10 +704,12 @@ impl CursorOverlayApp {
         #[cfg(target_os = "windows")]
         {
             if passthrough {
-                if !visible && !self.cursor_hidden {
+                if !visible {
+                    // Re-apply every frame: other windows (e.g. a PDF
+                    // viewer) may re-show the cursor in between.
                     platform::set_system_cursor_visible(false);
                     self.cursor_hidden = true;
-                } else if visible && self.cursor_hidden {
+                } else if self.cursor_hidden {
                     platform::set_system_cursor_visible(true);
                     self.cursor_hidden = false;
                 }
@@ -913,10 +1047,19 @@ impl eframe::App for CursorOverlayApp {
 
         if os_mode {
             // Real OS cursor image, region-limited by toggling it on/off.
+            // `set_cursor_image` is winit's path; `set_cursor_handle` is a
+            // direct SetCursor that we re-apply EVERY frame so an app (e.g.
+            // a PDF viewer's canvas) cannot override our cursor.
             if in_region {
                 ctx.set_cursor_image(Some(self.os_cursor.clone()));
+                #[cfg(target_os = "windows")]
+                if self.hcursor != 0 {
+                    platform::set_cursor_handle(Some(self.hcursor));
+                }
             } else {
                 ctx.set_cursor_image(None);
+                #[cfg(target_os = "windows")]
+                platform::set_cursor_handle(None);
             }
             ctx.set_cursor_icon(CursorIcon::Default);
             self.set_system_cursor_visible(false, true);
@@ -977,6 +1120,10 @@ impl Drop for CursorOverlayApp {
     fn drop(&mut self) {
         // Never leave the system cursor hidden.
         self.set_system_cursor_visible(true, true);
+        #[cfg(target_os = "windows")]
+        if self.hcursor != 0 {
+            platform::destroy_cursor(self.hcursor);
+        }
     }
 }
 

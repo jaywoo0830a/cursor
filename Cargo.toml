@@ -27,7 +27,7 @@ env_logger = "0.11"
 # Windows: global cursor position (GetCursorPos) + system cursor visibility
 # (ShowCursor) + direct click pass-through (WS_EX_TRANSPARENT).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 raw-window-handle = "0.6"
 
 [profile.release]
