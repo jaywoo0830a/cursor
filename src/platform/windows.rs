@@ -10,7 +10,7 @@
 //! * click pass-through via `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`)
 //! * target-window tracking (`EnumWindows`, `GetWindowRect`)
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// A Windows window handle (`HWND`).
@@ -428,4 +428,82 @@ fn cursor_guard_loop() {
 pub fn stop_cursor_guard() {
     GUARD_STOP.store(true, Ordering::SeqCst);
     GUARD_HIDE.store(false, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Input forwarding — cursor-owning mode
+// ---------------------------------------------------------------------------
+// When the overlay window owns the hit-testing (non-click-through, so it also
+// owns `WM_SETCURSOR` and the app below can never override the cursor), it
+// also intercepts all mouse/pen input. We replay those events to the window
+// below ours so the app keeps behaving normally (clicks, drawing, wheel,
+// hover).
+
+static FORWARD_ON: AtomicBool = AtomicBool::new(false);
+static FORWARD_HWND: AtomicUsize = AtomicUsize::new(0);
+
+/// Enable/disable forwarding of pointer input to the window below our
+/// overlay. `our_hwnd` is the overlay window (excluded from the target
+/// search).
+pub fn set_forwarding(enabled: bool, our_hwnd: usize) {
+    FORWARD_ON.store(enabled, Ordering::Relaxed);
+    FORWARD_HWND.store(our_hwnd, Ordering::Relaxed);
+}
+
+/// Topmost visible top-level window (excluding `exclude`) whose rect contains
+/// `(x, y)`, walking the Z-order downward from the top.
+fn window_below_at(x: i32, y: i32, exclude: usize) -> Option<HWND> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetTopWindow, GetWindow, GetWindowRect, IsIconic, IsWindowVisible, GW_HWNDNEXT,
+    };
+    unsafe {
+        let mut h = GetTopWindow(std::ptr::null_mut());
+        while !h.is_null() {
+            if h as usize != exclude && IsWindowVisible(h) != 0 && IsIconic(h) == 0 {
+                let mut r = std::mem::zeroed::<windows_sys::Win32::Foundation::RECT>();
+                if GetWindowRect(h, &mut r) != 0
+                    && x >= r.left
+                    && x < r.right
+                    && y >= r.top
+                    && y < r.bottom
+                {
+                    return Some(h);
+                }
+            }
+            h = GetWindow(h, GW_HWNDNEXT);
+        }
+        None
+    }
+}
+
+/// Replay one pointer message to the window below our overlay.
+/// `wparam` is the message's wParam (modifier keys / wheel-delta high word).
+pub fn forward_mouse(pt_x: i32, pt_y: i32, msg: u32, wparam: usize) {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostMessageW, SetForegroundWindow, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_RBUTTONDOWN,
+        WM_XBUTTONDOWN,
+    };
+    if !FORWARD_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let exclude = FORWARD_HWND.load(Ordering::Relaxed);
+    unsafe {
+        let Some(hwnd) = window_below_at(pt_x, pt_y, exclude) else {
+            return;
+        };
+        let mut pt = POINT { x: pt_x, y: pt_y };
+        ScreenToClient(hwnd, &mut pt);
+        let lparam = (((pt.y as u32) & 0xFFFF) as usize) << 16
+            | ((pt.x as u32) & 0xFFFF) as usize;
+        // Activate the target on press so clicks behave naturally.
+        if matches!(
+            msg,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        ) {
+            SetForegroundWindow(hwnd);
+        }
+        PostMessageW(hwnd, msg, wparam, lparam as isize);
+    }
 }

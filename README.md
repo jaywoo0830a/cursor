@@ -18,16 +18,31 @@ apps below (Windows). Outside the region the normal system cursor is used.
 - **Modern precision-reticle cursor** (anti-aliased): a thin ring with a dark
   outline and a small center dot, hotspot at the center. Replace it with your
   own bitmap via `assets/cursor.png`.
-- **Blocks the system cursor (root cause fix)** — inside the region the OS
-  cursor is **fully hidden** (`ShowCursor` pushed well below 0, re-enforced
-  by a dedicated high-frequency guard thread) and our circle is **painted**
-  on the topmost layer instead. Because the system cursor simply does not
-  exist while the pointer is in the region, no other process or driver can
-  make it "pop out" — whatever they call `SetCursor`/`SetSystemCursor` with
-  is invisible. This is what makes pen/tablet writing (OTD, Windows Ink)
-  flicker-free.
+- **Cursor-owning mode (default, root-cause fix)** — while the pointer is
+  inside the region, the overlay window **stops being click-through and owns
+  the hit-testing/cursor** (`WM_SETCURSOR`). Because it is the window on top,
+  the apps below can *never* override the cursor — there is no "pop-out" at
+  all, and it even works over DirectComposition / GPU canvases (the OS itself
+  draws our circle for this window). Inside the region the window cursor is
+  our circle (`SetCursorImage` + per-frame `SetCursor`); outside it the
+  overlay is click-through again so the apps below keep their own cursor.
+  All input — mouse moves, buttons, wheel, and pen strokes (Windows Ink /
+  OTD synthesize mouse messages that the `WH_MOUSE_LL` hook sees) — is
+  **forwarded** to the app below via `PostMessage` (with
+  `ScreenToClient` + `SetForegroundWindow` on press), so clicking, drawing
+  and scrolling all still work normally.
+- **Fallback hide+paint mode** — if you turn *Own cursor* off, the earlier
+  strategy is used instead: inside the region the OS cursor is **fully
+  hidden** (`ShowCursor` pushed well below 0, re-enforced by a dedicated
+  high-frequency guard thread) and our circle is **painted** on the topmost
+  layer. Because the system cursor simply does not exist while the pointer is
+  in the region, no other process or driver can make it "pop out" — whatever
+  they call `SetCursor`/`SetSystemCursor` with is invisible. This is the
+  legacy flicker-free fallback for pen/tablet writing (OTD, Windows Ink).
 - **Click pass-through:** clicks pass through the overlay to the apps below.
-  Enforced directly with `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`).
+  Enforced directly with `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`). In
+  cursor-owning mode pass-through is applied automatically *outside* the
+  region (non-click-through inside, since we must own the hit-testing).
 - **Low-level raw input (Windows):** a background thread runs its own Win32
   message loop and captures, via raw Win32 API (`windows-sys`):
   * **Mouse** — a global `WH_MOUSE_LL` hook (move / buttons / wheel with
@@ -40,8 +55,8 @@ apps below (Windows). Outside the region the normal system cursor is used.
   * **Debounced (~1 ms):** events are coalesced (latest state, summed
     deltas) and flushed by a dedicated thread, so high-rate HID devices
     don't flood the app. Live state is shown in the settings panel (F1).
-- Region-limited behavior: inside the region the system cursor is replaced by
-  the custom cursor; outside it the normal system cursor is used.
+- Region-limited behavior: inside the region the custom cursor is shown;
+  outside it the normal system cursor is used.
 - **Overlay a specific window (Windows):** give a window title substring and
   the overlay resizes to exactly cover that window and follows it as it
   moves/resizes. This is the standard, safe way to "attach" the overlay to a
@@ -67,8 +82,9 @@ F1 settings · Esc quit   |   pass:ON · region:IN · in:pen
 
 `pass` = click pass-through on, `region` = whether the mouse is currently
 inside the overlay region, `in` = last raw input device seen (mouse / pen /
-touch / touchpad). Inside the region the system cursor is hidden and our
-circle is painted; outside it the normal system cursor is used.
+touch / touchpad). Inside the region the cursor is ours (owned window cursor
+or hidden+painted, depending on mode); outside it the normal system cursor is
+used.
 
 ## Build & run
 

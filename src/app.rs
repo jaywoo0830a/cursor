@@ -37,6 +37,7 @@ pub struct CursorOverlayApp {
     ctx: egui::Context,
     bitmap: CursorBitmap,
     texture: TextureHandle,
+    os_cursor: egui::CustomCursorImage,
 
     /// The overlay region, in window (screen) points.
     region: Rect,
@@ -54,6 +55,11 @@ pub struct CursorOverlayApp {
     /// cursor position is polled via `GetCursorPos`.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     passthrough: bool,
+    /// Cursor-owning mode: inside the region the overlay window owns the
+    /// hit-testing/cursor (apps below can never override it — no pop-out,
+    /// works over DirectComposition); input is forwarded to the app below.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    own_cursor: bool,
     /// Whether we currently hid the OS cursor via `ShowCursor(FALSE)`.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     cursor_hidden: bool,
@@ -113,6 +119,12 @@ impl CursorOverlayApp {
             TextureOptions::NEAREST,
         );
 
+        let os_cursor = egui::CustomCursorImage {
+            rgba: bitmap.rgba.clone(),
+            size: bitmap.size,
+            hotspot: bitmap.hotspot,
+        };
+
         // Optional CLI: --window "<title substring>" overlays a specific
         // window instead of the whole screen.
         let target_window = std::env::args()
@@ -165,6 +177,7 @@ impl CursorOverlayApp {
             ctx,
             bitmap,
             texture,
+            os_cursor,
             region: default_region(),
             // Start with the overlay active: no settings panel and no region
             // outline — just the transparent background and the cursor.
@@ -178,6 +191,7 @@ impl CursorOverlayApp {
             passthrough: true,
             #[cfg(not(target_os = "windows"))]
             passthrough: false,
+            own_cursor: true,
             cursor_hidden: false,
             last_passthrough: None,
             target_window,
@@ -477,6 +491,17 @@ impl CursorOverlayApp {
                          and the circle is painted instead — no other process\n\
                          or driver can show it. Uses global cursor tracking.",
                     );
+                #[cfg(target_os = "windows")]
+                ui.checkbox(&mut self.own_cursor, "Own cursor (block pop-out at the source)")
+                    .on_hover_text(
+                        "While the pointer is inside the region, the overlay\n\
+                         window owns the hit-testing/cursor, so apps below can\n\
+                         NEVER override it — no pop-out, and it works even over\n\
+                         DirectComposition/GPU canvases (the OS itself draws\n\
+                         our circle for this window). All mouse/pen input is\n\
+                         then forwarded to the app below, and clicks outside\n\
+                         the region pass through normally.",
+                    );
                 ui.separator();
 
                 // ---- overlay a specific window (Windows) ----
@@ -643,22 +668,10 @@ impl eframe::App for CursorOverlayApp {
         // 정상 시스템 커서를 복원한다.
         let overlay_on = self.enabled && !self.editing && !self.show_settings;
 
-        #[cfg(target_os = "windows")]
-        let passthrough = self.passthrough && overlay_on;
-        #[cfg(not(target_os = "windows"))]
-        let passthrough = false;
-
-        if self.last_passthrough != Some(passthrough) {
-            self.last_passthrough = Some(passthrough);
-            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
-            #[cfg(target_os = "windows")]
-            if self.native_hwnd != 0 {
-                platform::apply_passthrough(self.native_hwnd, passthrough);
-            }
-        }
-
-        // ---- pointer position ----
-        let pointer = self.pointer_pos(&ctx, passthrough);
+        // ---- pointer position (uses last frame's pass-through decision so a
+        //      `GetCursorPos` poll inside click-through windows keeps
+        //      working while we toggle ownership) ----
+        let pointer = self.pointer_pos(&ctx, self.last_passthrough.unwrap_or(false));
 
         // ---- region editing ----
         if self.editing {
@@ -681,14 +694,72 @@ impl eframe::App for CursorOverlayApp {
         }
         let in_region_eff = self.out_region_frames < 3;
 
-        // High-frequency guard: continuously re-hide the system cursor while
-        // the overlay is active inside the region, so no other process or
-        // driver can ever show it in between frames.
+        // Cursor-owning mode: while the pointer is inside the region, the
+        // overlay window owns the hit-testing/cursor, so the app below can
+        // never override it (no pop-out — works over DirectComposition/GPU
+        // canvases too, because the OS itself draws our circle for this
+        // window). All input is then forwarded to the app below.
         #[cfg(target_os = "windows")]
-        platform::set_cursor_guard(overlay_on && in_region_eff);
+        let owning = self.own_cursor && overlay_on && in_region_eff;
+        #[cfg(not(target_os = "windows"))]
+        let owning = false;
 
-        if overlay_on && in_region_eff {
-            // 영역 안: 시스템 커서 숨김 + 우리 원 그림.
+        // Pass-through:
+        //  * cursor-owning mode: click-through OUTSIDE the region (the app
+        //    owns the cursor there), non-click-through INSIDE (we own it).
+        //  * hide+paint mode: the user's manual toggle.
+        #[cfg(target_os = "windows")]
+        let passthrough = if self.own_cursor {
+            overlay_on && !owning
+        } else {
+            self.passthrough && overlay_on
+        };
+        #[cfg(not(target_os = "windows"))]
+        let passthrough = false;
+
+        if self.last_passthrough != Some(passthrough) {
+            self.last_passthrough = Some(passthrough);
+            ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(passthrough));
+            #[cfg(target_os = "windows")]
+            if self.native_hwnd != 0 {
+                platform::apply_passthrough(self.native_hwnd, passthrough);
+            }
+        }
+
+        // Input forwarding (cursor-owning mode): replay pointer events to the
+        // app below while we own the hit-testing inside the region.
+        #[cfg(target_os = "windows")]
+        platform::set_forwarding(owning, self.native_hwnd);
+
+        // High-frequency guard: only used by hide+paint mode to keep the
+        // system cursor hidden.
+        #[cfg(target_os = "windows")]
+        platform::set_cursor_guard(!self.own_cursor && overlay_on && in_region_eff);
+
+        if self.own_cursor {
+            // 커서 소유 모드: 영역 안이면 우리 창이 커서를 소유한다. 아래 앱은
+            // WM_SETCURSOR를 받지 못해 커서를 바꿀 수 없고, OS가 우리 원을 그리므로
+            // DirectComposition 캔버스 위에도 항상 보인다. 입력은 위에서 포워딩.
+            if owning {
+                ctx.set_cursor_image(Some(self.os_cursor.clone()));
+                #[cfg(target_os = "windows")]
+                platform::set_cursor_handle(Some(self.hcursor));
+                #[cfg(target_os = "windows")]
+                if self.hcursor != 0 {
+                    platform::set_system_cursor_active(true, self.hcursor);
+                }
+            } else {
+                ctx.set_cursor_icon(CursorIcon::Default);
+                ctx.set_cursor_image(None);
+                #[cfg(target_os = "windows")]
+                platform::set_cursor_handle(None);
+                #[cfg(target_os = "windows")]
+                if self.hcursor != 0 {
+                    platform::set_system_cursor_active(false, self.hcursor);
+                }
+            }
+        } else if overlay_on && in_region_eff {
+            // hide+paint 모드 (기존): 시스템 커서 숨김 + 우리 원 그림.
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
                 self.hide_cursor(true);
@@ -761,6 +832,9 @@ impl Drop for CursorOverlayApp {
         }
         #[cfg(target_os = "windows")]
         platform::stop_cursor_guard();
+        // Disable input forwarding so no replay happens after teardown.
+        #[cfg(target_os = "windows")]
+        platform::set_forwarding(false, 0);
         input::stop();
     }
 }

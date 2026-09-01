@@ -196,6 +196,7 @@ pub fn last_global_mouse_pos() -> Option<(f64, f64)> {
 #[cfg(target_os = "windows")]
 mod win {
     use super::*;
+    use crate::platform;
     use std::mem::size_of;
     use std::sync::Mutex;
     use std::sync::OnceLock;
@@ -402,24 +403,40 @@ mod win {
     }
 
     /// Global low-level mouse hook: merges every mouse event (position,
-    /// buttons, wheel) into the debounced coalescer and tracks the latest
-    /// global position for the low-latency position fallback.
+    /// buttons, wheel) into the debounced coalescer, tracks the latest
+    /// global position for the low-latency position fallback, and — when the
+    /// overlay owns the hit-testing — forwards the event to the app below.
     unsafe extern "system" fn mouse_ll_hook(code: i32, wparam: usize, lparam: isize) -> isize {
         if code >= 0 {
             let m = &*(lparam as *const wam::MSLLHOOKSTRUCT);
             let msg = wparam as u32;
+            let (x, y) = (m.pt.x, m.pt.y);
             match msg {
                 wam::WM_MOUSEMOVE => {
-                    set_last_pos(m.pt.x as f64, m.pt.y as f64);
-                    coalesce().mouse_move(m.pt.x as f64, m.pt.y as f64);
+                    set_last_pos(x as f64, y as f64);
+                    coalesce().mouse_move(x as f64, y as f64);
+                    platform::forward_mouse(x, y, msg, 0);
                 }
-                wam::WM_LBUTTONDOWN => coalesce().mouse_button(true, false, true),
-                wam::WM_LBUTTONUP => coalesce().mouse_button(true, false, false),
-                wam::WM_RBUTTONDOWN => coalesce().mouse_button(false, true, true),
-                wam::WM_RBUTTONUP => coalesce().mouse_button(false, true, false),
+                wam::WM_LBUTTONDOWN => {
+                    coalesce().mouse_button(true, false, true);
+                    platform::forward_mouse(x, y, msg, 1); // MK_LBUTTON
+                }
+                wam::WM_LBUTTONUP => {
+                    coalesce().mouse_button(true, false, false);
+                    platform::forward_mouse(x, y, msg, 0);
+                }
+                wam::WM_RBUTTONDOWN => {
+                    coalesce().mouse_button(false, true, true);
+                    platform::forward_mouse(x, y, msg, 2); // MK_RBUTTON
+                }
+                wam::WM_RBUTTONUP => {
+                    coalesce().mouse_button(false, true, false);
+                    platform::forward_mouse(x, y, msg, 0);
+                }
                 wam::WM_MOUSEWHEEL => {
                     let delta = (m.mouseData >> 16) as u16 as i16 as i32;
                     coalesce().wheel(delta);
+                    platform::forward_mouse(x, y, msg, (delta as u16 as usize) << 16);
                 }
                 _ => {}
             }

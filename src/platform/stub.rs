@@ -46,4 +46,8 @@ pub fn set_cursor_guard(_hide: bool) {}
 
 pub fn stop_cursor_guard() {}
 
+pub fn set_forwarding(_enabled: bool, _our_hwnd: usize) {}
+
+pub fn forward_mouse(_x: i32, _y: i32, _msg: u32, _wparam: usize) {}
+
 pub fn restore_system_cursor_swap() {}
