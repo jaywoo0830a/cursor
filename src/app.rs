@@ -9,6 +9,7 @@ use eframe::egui::{
 use crate::config::{default_region, HANDLE_SIZE, MIN_REGION, CURSOR_DISPLAY_SIZE};
 use crate::cursor::{self, CursorBitmap};
 use crate::input::{self, InputEvent, InputSnapshot};
+use crate::pointer_filter::{PenSignal, PointerFilter};
 #[cfg(target_os = "windows")]
 use crate::platform;
 
@@ -104,8 +105,9 @@ pub struct CursorOverlayApp {
     /// becomes idle again).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     was_pen_active: bool,
-    /// Last time a pen event arrived (activity-based "pen in use" detection).
-    last_pen_event: std::time::Instant,
+    /// Pointer-source state machine: detects pen-related states and the
+    /// pen-involving transition moments so the system cursor never pops out.
+    pointer_filter: PointerFilter,
     /// While the pen is in use (hovering or touching), hide the OS cursor
     /// entirely and paint our circle instead — no competition, no flicker.
     hide_cursor_with_pen: bool,
@@ -224,7 +226,7 @@ impl CursorOverlayApp {
             out_region_frames: 0,
             last_swap_reassert: std::time::Instant::now(),
             was_pen_active: false,
-            last_pen_event: std::time::Instant::now(),
+            pointer_filter: PointerFilter::new(),
             hide_cursor_with_pen: true,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
@@ -614,7 +616,8 @@ impl CursorOverlayApp {
                         "mouse:  ({:.0}, {:.0})   rawΔ: ({}, {})  wheel: {}\n\
                          pen:    {}  pressure {:.2}  tilt ({:.0}°, {:.0}°)\n\
                          touch:  {}   touchpad: {}\n\
-                         device: {}   HID reports: {}",
+                         device: {}   HID reports: {}\n\
+                         source: {:?}   suppress: {}",
                         self.raw.mouse.0,
                         self.raw.mouse.1,
                         self.raw.raw_delta.0,
@@ -632,6 +635,8 @@ impl CursorOverlayApp {
                         if pad { "active" } else { "none" },
                         self.raw.last_device,
                         self.raw.hid_reports,
+                        self.pointer_filter.state(),
+                        self.pointer_filter.state().is_pen(),
                     ));
                     ui.weak(
                         "Pen / touch / trackpad are captured raw via HID raw input\n\
@@ -670,15 +675,35 @@ impl eframe::App for CursorOverlayApp {
         let ctx = ui.ctx().clone();
 
         // ---- drain raw low-level input events (mouse / pen / touch) ----
+        let mut frame_pen = false;
+        let mut frame_mouse = false;
+        let mut frame_pad = false;
         if let Some(rx) = &self.raw_rx {
             while let Ok(ev) = rx.try_recv() {
-                // Track the last pen event for activity-based pen detection.
-                if matches!(&ev, InputEvent::Pen { .. }) {
-                    self.last_pen_event = std::time::Instant::now();
+                match &ev {
+                    InputEvent::Pen { .. } => frame_pen = true,
+                    InputEvent::Touch { .. } | InputEvent::Touchpad { .. } => frame_pad = true,
+                    InputEvent::MouseMove { .. }
+                    | InputEvent::MouseButton { .. }
+                    | InputEvent::MouseWheel { .. }
+                    | InputEvent::RawMouse { .. } => frame_mouse = true,
+                    _ => {}
                 }
                 self.raw.apply(&ev);
             }
         }
+        // Feed the pointer-source state machine. It returns true whenever the
+        // pointer is in a pen state OR right after a pen-involving transition
+        // (pen down↔up, pen↔mouse, pen↔pad …) — the moments the system cursor
+        // tends to pop out.
+        let pen_signal = if frame_pen {
+            self.raw
+                .pen
+                .map(|c| PenSignal { down: c.down, in_range: c.in_range })
+        } else {
+            None
+        };
+        let pen_suppress = self.pointer_filter.update(pen_signal, frame_mouse, frame_pad);
 
         // ---- keyboard shortcuts ----
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
@@ -756,23 +781,13 @@ impl eframe::App for CursorOverlayApp {
         }
         let in_region_eff = self.out_region_frames < 3;
 
-        // "Pen in use" = the pen is hovering (in range) or touching (down).
-        // It is activity-based: a pen event within the last ~0.8 s counts as
-        // in use, so a stale in-range flag can't keep the system cursor
-        // hidden forever (a short pause returns to normal).
-        let pen_in_use = self.raw.pen.is_some_and(|c| c.in_range || c.down);
-        let pen_recent =
-            self.last_pen_event.elapsed() < std::time::Duration::from_millis(800);
-
-        // While the pen is in use inside the region — down OR hovering — the
-        // OS cursor is fully hidden and our circle is painted instead (see
-        // the os_mode branch below): no cursor competition, no flicker, in
-        // any pen state.
-        let pen_active = self.hide_cursor_with_pen
-            && os_mode
-            && in_region_eff
-            && pen_recent
-            && pen_in_use;
+        // While the pointer is in a pen state (down or hovering) — or right
+        // after a pen-involving transition — inside the region, the OS cursor
+        // is fully hidden and our circle is painted instead (see the os_mode
+        // branch below): no cursor competition, no flicker, in any pen state
+        // or transition.
+        let pen_active =
+            self.hide_cursor_with_pen && os_mode && in_region_eff && pen_suppress;
 
         // High-frequency guard: keep our circle showing (or keep it hidden
         // while the pen is in use) so no other process/driver can take the
