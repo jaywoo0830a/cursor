@@ -1,0 +1,15 @@
+[package]
+name = "custom-cursor-overlay"
+version = "0.1.0"
+edition = "2021"
+description = "Overlay that shows only a custom cursor inside a user-defined region, built with egui 0.36 / eframe 0.36"
+
+[dependencies]
+eframe = "0.36.1"
+egui = "0.36.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
