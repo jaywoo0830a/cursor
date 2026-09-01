@@ -102,6 +102,9 @@ pub struct CursorOverlayApp {
     /// Last time just the arrow (`OCR_NORMAL`) was re-asserted (Windows).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     last_normal_reassert: std::time::Instant,
+    /// While the pen is down (writing), hide the OS cursor entirely and paint
+    /// our circle instead — this blocks cursor flicker at the source.
+    hide_cursor_while_writing: bool,
 
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
@@ -211,6 +214,7 @@ impl CursorOverlayApp {
             out_region_frames: 0,
             last_swap_reassert: std::time::Instant::now(),
             last_normal_reassert: std::time::Instant::now(),
+            hide_cursor_while_writing: true,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -516,6 +520,13 @@ impl CursorOverlayApp {
                          swap) and the painted cursor. Uses global cursor\n\
                          tracking (GetCursorPos / raw input hook).",
                     );
+                #[cfg(target_os = "windows")]
+                ui.checkbox(&mut self.hide_cursor_while_writing, "Hide cursor while writing (pen)")
+                    .on_hover_text(
+                        "While the pen is down (writing), the OS cursor is\n\
+                         fully hidden and the circle is painted instead, so\n\
+                         the tablet driver/app cannot make it flicker.",
+                    );
                 ui.separator();
 
                 // ---- overlay a specific window (Windows) ----
@@ -741,13 +752,22 @@ impl eframe::App for CursorOverlayApp {
         }
         let in_region_eff = self.out_region_frames < 3;
 
+        // While the pen is down inside the region we "write" with it. To
+        // block the cursor flicker at the source, the OS cursor is fully
+        // hidden during writing and our circle is painted instead (see the
+        // os_mode branch below).
+        let pen_writing = self.hide_cursor_while_writing
+            && os_mode
+            && in_region_eff
+            && self.raw.pen.is_some_and(|c| c.down);
+
         // Re-assert the custom circle from the global mouse hook on every
         // mouse event (Windows), so apps that set their own cursor — e.g. an
         // I-beam while typing or a hand while hovering — still show our
         // circle. Only active in OS mode while the pointer is inside the
-        // region.
+        // region (and not while writing, where the OS cursor is hidden).
         input::set_forced_cursor(
-            if os_mode && in_region_eff && self.hcursor != 0 {
+            if os_mode && in_region_eff && !pen_writing && self.hcursor != 0 {
                 Some(self.hcursor)
             } else {
                 None
@@ -762,39 +782,61 @@ impl eframe::App for CursorOverlayApp {
             // frame so an app (e.g. a PDF viewer's canvas) cannot override us.
             #[cfg(target_os = "windows")]
             if self.hcursor != 0 {
-                platform::set_system_cursor_active(in_region_eff, self.hcursor);
-                // Re-assert just the arrow at high rate (~60 Hz) so a driver
-                // revert — which flashes the system arrow — is undone within
-                // a single frame.
-                if self.last_normal_reassert.elapsed()
-                    >= std::time::Duration::from_millis(16)
-                {
-                    self.last_normal_reassert = std::time::Instant::now();
-                    platform::reassert_normal_cursor_swap();
-                }
-                // Some tablet drivers revert the system cursors (e.g. via
-                // SPI_SETCURSORS) the instant the pen touches; re-apply the
-                // full swap immediately on pen/touch events and periodically
-                // so the circle always comes back.
-                if raw_pointer
-                    || self.last_swap_reassert.elapsed()
-                        >= std::time::Duration::from_millis(250)
-                {
-                    self.last_swap_reassert = std::time::Instant::now();
-                    platform::reassert_system_cursor_swap();
+                if pen_writing {
+                    // 원천 봉쇄: 필기 중에는 OS 커서를 완전히 숨겨서 드라이버/앱이
+                    // 아무리 커서를 바꿔도 깜빡일 수 없게 한다 (우리 원은 아래에서
+                    // 직접 그림). 커서 교체/재적용도 중단해 CPU를 아낀다.
+                    platform::set_system_cursor_visible(false);
+                    self.cursor_hidden = true;
+                } else {
+                    if self.cursor_hidden {
+                        platform::set_system_cursor_visible(true);
+                        self.cursor_hidden = false;
+                    }
+                    platform::set_system_cursor_active(in_region_eff, self.hcursor);
+                    // Re-assert just the arrow at high rate (~60 Hz) so a
+                    // driver revert — which flashes the system arrow — is
+                    // undone within a single frame.
+                    if self.last_normal_reassert.elapsed()
+                        >= std::time::Duration::from_millis(16)
+                    {
+                        self.last_normal_reassert = std::time::Instant::now();
+                        platform::reassert_normal_cursor_swap();
+                    }
+                    // Some tablet drivers revert the system cursors (e.g. via
+                    // SPI_SETCURSORS) the instant the pen touches; re-apply
+                    // the full swap immediately on pen/touch events and
+                    // periodically so the circle always comes back.
+                    if raw_pointer
+                        || self.last_swap_reassert.elapsed()
+                            >= std::time::Duration::from_millis(250)
+                    {
+                        self.last_swap_reassert = std::time::Instant::now();
+                        platform::reassert_system_cursor_swap();
+                    }
                 }
             }
-            if in_region {
-                ctx.set_cursor_image(Some(self.os_cursor.clone()));
-                #[cfg(target_os = "windows")]
-                platform::set_cursor_handle(Some(self.hcursor));
-            } else {
+            if pen_writing {
+                // OS 커서는 숨겼으니 그 자리에 우리 원을 직접 그려 표시한다.
+                if let Some(p) = pointer {
+                    self.paint_custom_cursor(&ctx, p);
+                }
+                ctx.set_cursor_icon(CursorIcon::None);
                 ctx.set_cursor_image(None);
                 #[cfg(target_os = "windows")]
                 platform::set_cursor_handle(None);
+            } else {
+                if in_region {
+                    ctx.set_cursor_image(Some(self.os_cursor.clone()));
+                    #[cfg(target_os = "windows")]
+                    platform::set_cursor_handle(Some(self.hcursor));
+                } else {
+                    ctx.set_cursor_image(None);
+                    #[cfg(target_os = "windows")]
+                    platform::set_cursor_handle(None);
+                }
+                ctx.set_cursor_icon(CursorIcon::Default);
             }
-            ctx.set_cursor_icon(CursorIcon::Default);
-            self.set_system_cursor_visible(false, true);
         } else if overlay_on && passthrough {
             // Painted cursor with click pass-through (Windows): hide the
             // system cursor only inside the region and draw ours.
@@ -832,11 +874,12 @@ impl eframe::App for CursorOverlayApp {
                 format!(" · in:{}", self.raw.last_device)
             };
             let status = format!(
-                "F1 settings · Esc quit   |   cursor:{} · pass:{} · region:{}{}",
+                "F1 settings · Esc quit   |   cursor:{} · pass:{} · region:{}{}{}",
                 if os_mode { "IMG" } else { "PAINT" },
                 if passthrough { "ON" } else { "off" },
                 if in_region { "IN" } else { "OUT" },
                 device,
+                if pen_writing { " · write" } else { "" },
             );
             let painter = ctx.debug_painter();
             painter.text(
