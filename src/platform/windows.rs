@@ -220,6 +220,31 @@ pub fn polish_overlay_window(hwnd: usize) {
     }
 }
 
+/// Log the window's style / extended style (diagnostic: confirms
+/// transparency + pass-through are actually applied).
+pub fn log_window_styles(hwnd: usize) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, GWL_EXSTYLE, GWL_STYLE, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+        WS_EX_TRANSPARENT, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    };
+    unsafe {
+        let h = hwnd as *mut core::ffi::c_void;
+        let s = GetWindowLongPtrW(h, GWL_STYLE);
+        let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+        log::info!(
+            "overlay window: style=0x{:x} exstyle=0x{:x} | popup={} thickframe={} visible={} layered={} transparent={} toolwindow={}",
+            s,
+            ex,
+            (s & WS_POPUP as isize) != 0,
+            (s & WS_THICKFRAME as isize) != 0,
+            (s & WS_VISIBLE as isize) != 0,
+            (ex & WS_EX_LAYERED as isize) != 0,
+            (ex & WS_EX_TRANSPARENT as isize) != 0,
+            (ex & WS_EX_TOOLWINDOW as isize) != 0,
+        );
+    }
+}
+
 // (system-cursor swapping removed — the Chromium frontend owns the cursor)
 // ---------------------------------------------------------------------------
 // Input forwarding — cursor-owning mode

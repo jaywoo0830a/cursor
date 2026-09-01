@@ -97,6 +97,9 @@ pub struct App {
     last_out_region: Option<Instant>,
     last_passthrough: Option<bool>,
     last_sent: Option<String>,
+    /// How many startup ticks to force a state push (insurance so the webview
+    /// receives state even if it loads later than the first change).
+    startup_pushes: u32,
     last_pen_at: Option<Instant>,
 
     // --- Rust region editing (mouse) ---
@@ -134,7 +137,9 @@ impl App {
                 // Build our reticle as a real OS cursor (Rust-drawn, OS shows
                 // it whenever we own the hit-testing).
                 let (rgba, hot) = cursor::make_cursor_bitmap(32);
-                platform::create_hcursor_from_rgba(&rgba, 32, 32, hot[0], hot[1])
+                let hc = platform::create_hcursor_from_rgba(&rgba, 32, 32, hot[0], hot[1]);
+                log::info!("created native cursor handle: {hc}");
+                hc
             },
             #[cfg(not(target_os = "windows"))]
             hcursor: 0,
@@ -142,6 +147,7 @@ impl App {
             win_w: 0.0,
             win_h: 0.0,
             win_origin: (0.0, 0.0),
+            startup_pushes: 60,
             last_out_region: None,
             last_passthrough: None,
             last_sent: None,
@@ -290,7 +296,10 @@ impl App {
             }
         }
 
-        if self.force_push {
+        if self.force_push || self.startup_pushes > 0 {
+            if self.startup_pushes > 0 {
+                self.startup_pushes -= 1;
+            }
             self.force_push = false;
             self.last_sent = None;
         }
@@ -298,6 +307,13 @@ impl App {
         let state = self.state_json(owning, in_region_eff, passthrough, pen_active);
         if self.last_sent.as_deref() != Some(state.as_str()) {
             self.last_sent = Some(state.clone());
+            log::debug!(
+                "owning={owning} passthrough={passthrough} pen={pen_active} found={} editing={} enabled={} cursor={}",
+                self.window_follow_active,
+                self.editing,
+                self.enabled,
+                self.hcursor
+            );
             return Some(state);
         }
         None
@@ -515,6 +531,7 @@ impl App {
                     if !self.window_follow_active {
                         self.window_follow_active = true;
                         window.set_fullscreen(None);
+                        log::info!("target window found, following rect {rect:?}");
                     }
                     if self.last_target_rect != Some(rect) {
                         self.last_target_rect = Some(rect);

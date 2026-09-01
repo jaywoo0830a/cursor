@@ -16,8 +16,10 @@
     overflow: hidden; background: transparent;
     user-select: none; -webkit-user-select: none;
   }
-  body:not(.owning) { cursor: default; }
-  body.owning, body.owning * { cursor: none !important; }
+  /* The webview NEVER draws a cursor: it stays `cursor: none` at all times.
+     The actual cursor is the native OS cursor Rust sets with SetCursor, so
+     WebView2 can never override the circle — even if a state push fails. */
+  html, body, body * { cursor: none !important; }
 
   /* ---- region outline (dashed when shown, solid while editing) ---- */
   #region {
@@ -54,7 +56,6 @@
 // Pure presentation: applies the state pushed by Rust. No API / IPC / logic.
 window.__setState = function (s) {
   s = s || {};
-  document.body.classList.toggle("owning", !!s.owning);
 
   var r = document.getElementById("region");
   var show = !!(s.editing || s.show_region);

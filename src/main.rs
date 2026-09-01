@@ -76,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let hwnd = window.hwnd() as usize;
             app.set_native_hwnd(hwnd);
             platform::polish_overlay_window(hwnd);
+            platform::log_window_styles(hwnd);
         }
         let scale = window.scale_factor();
         app.set_scale(scale);
@@ -101,15 +102,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .with_on_page_load_handler({
             let app = app_arc.clone();
-            move |event, _url| {
+            move |event, url| {
                 if matches!(event, PageLoadEvent::Finished) {
+                    log::info!("webview page loaded: {url}");
                     app.lock().unwrap().request_push();
                 }
             }
         })
         .build(&window)?;
 
-    log::info!("overlay ready: F1/gear toggles settings, Esc quits (via the frontend)");
+    log::info!("webview built");
+    log::info!(
+        "overlay ready — hotkeys: Ctrl+Shift C(on/off) R(영역편집) O(윤곽) 0(전체) Q(종료), Esc(종료)"
+    );
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
