@@ -40,7 +40,12 @@ pub fn set_system_cursor_visible(visible: bool) {
             // Force the counter back up so the cursor is visible again.
             while ShowCursor(1) < 0 {}
         } else {
-            // Force the counter down so the cursor is hidden.
+            // Push the counter well below 0: a handful of ShowCursor(TRUE)
+            // calls by apps (e.g. Windows Ink / OTD while the pen moves)
+            // between our frames cannot re-show the cursor.
+            for _ in 0..10 {
+                ShowCursor(0);
+            }
             while ShowCursor(0) >= 0 {}
         }
     }

@@ -104,6 +104,9 @@ pub struct CursorOverlayApp {
     /// pen-up transition).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     was_writing: bool,
+    /// Consecutive frames the pen has been lifted while in writing mode
+    /// (hysteresis against contact-bit jitter near the touch threshold).
+    pen_up_frames: u32,
     /// While the pen is down (writing), hide the OS cursor entirely and paint
     /// our circle instead — this blocks cursor flicker at the source.
     hide_cursor_while_writing: bool,
@@ -216,6 +219,7 @@ impl CursorOverlayApp {
             out_region_frames: 0,
             last_swap_reassert: std::time::Instant::now(),
             was_writing: false,
+            pen_up_frames: 0,
             hide_cursor_while_writing: true,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
@@ -742,6 +746,18 @@ impl eframe::App for CursorOverlayApp {
         }
         let in_region_eff = self.out_region_frames < 3;
 
+        // Pen contact can jitter near the touch threshold ("just barely
+        // touching"), which would toggle the writing mode and make the cursor
+        // flicker between hidden/painted and the swapped circle. Add
+        // hysteresis: once writing, stay writing until the pen has been
+        // lifted for a few frames.
+        let pen_down = self.raw.pen.is_some_and(|c| c.down);
+        if pen_down {
+            self.pen_up_frames = 0;
+        } else {
+            self.pen_up_frames = self.pen_up_frames.saturating_add(1);
+        }
+
         // While the pen is down inside the region we "write" with it. To
         // block the cursor flicker at the source, the OS cursor is fully
         // hidden during writing and our circle is painted instead (see the
@@ -749,7 +765,7 @@ impl eframe::App for CursorOverlayApp {
         let pen_writing = self.hide_cursor_while_writing
             && os_mode
             && in_region_eff
-            && self.raw.pen.is_some_and(|c| c.down);
+            && (pen_down || self.pen_up_frames < 3);
 
         if os_mode {
             // OS bitmap cursor (region-limited). On Windows the system cursor
