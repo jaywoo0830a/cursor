@@ -29,7 +29,7 @@ env_logger = "0.11"
 # click pass-through (WS_EX_TRANSPARENT), low-level input (WH_MOUSE_LL hook
 # + RegisterRawInputDevices / WM_INPUT for mouse, pen, touch and trackpad).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input", "Win32_Media"] }
 raw-window-handle = "0.6"
 
 [profile.release]

@@ -180,6 +180,12 @@ impl CursorOverlayApp {
         let raw_rx = input::start();
         let raw = InputSnapshot::default();
 
+        // Start the high-frequency cursor guard (Windows): continuously
+        // re-asserts our circle (or keeps it hidden while writing) so no
+        // other process/driver can take the cursor over.
+        #[cfg(target_os = "windows")]
+        platform::start_cursor_guard();
+
         Self {
             ctx,
             bitmap,
@@ -767,6 +773,19 @@ impl eframe::App for CursorOverlayApp {
             && in_region_eff
             && (pen_down || self.pen_up_frames < 3);
 
+        // High-frequency guard: keep our circle showing (or keep it hidden
+        // while writing) so no other process/driver can take the cursor over
+        // — even between render frames.
+        #[cfg(target_os = "windows")]
+        platform::set_cursor_guard(
+            if os_mode && in_region_eff && !pen_writing && self.hcursor != 0 {
+                self.hcursor
+            } else {
+                0
+            },
+            pen_writing,
+        );
+
         if os_mode {
             // OS bitmap cursor (region-limited). On Windows the system cursor
             // bitmaps are swapped with SetSystemCursor while inside the
@@ -902,6 +921,8 @@ impl Drop for CursorOverlayApp {
             platform::restore_system_cursor_swap();
             platform::destroy_cursor(self.hcursor);
         }
+        #[cfg(target_os = "windows")]
+        platform::stop_cursor_guard();
         input::stop();
     }
 }

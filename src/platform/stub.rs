@@ -42,4 +42,10 @@ pub fn set_system_cursor_active(_active: bool, _custom: usize) {}
 
 pub fn reassert_system_cursor_swap() {}
 
+pub fn start_cursor_guard() {}
+
+pub fn set_cursor_guard(_force: usize, _hide: bool) {}
+
+pub fn stop_cursor_guard() {}
+
 pub fn restore_system_cursor_swap() {}

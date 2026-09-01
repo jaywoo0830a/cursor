@@ -10,6 +10,7 @@
 //! * click pass-through via `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`)
 //! * target-window tracking (`EnumWindows`, `GetWindowRect`)
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// A Windows window handle (`HWND`).
@@ -392,4 +393,75 @@ pub fn restore_system_cursor_swap() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// High-frequency cursor guard — "no takeover" (best effort)
+// ---------------------------------------------------------------------------
+// The cursor is a shared global resource: any process can call SetCursor /
+// SetSystemCursor, so in userspace we cannot *prevent* the call itself.
+// What we CAN do is make any takeover last only a few milliseconds by
+// continuously re-asserting our circle from a dedicated high-frequency
+// thread (1 ms timer resolution via timeBeginPeriod), independent of the
+// ~60 Hz render loop.
+
+static GUARD_STARTED: AtomicBool = AtomicBool::new(false);
+static GUARD_STOP: AtomicBool = AtomicBool::new(false);
+static GUARD_FORCE: AtomicUsize = AtomicUsize::new(0);
+static GUARD_HIDE: AtomicBool = AtomicBool::new(false);
+
+/// Start the high-frequency cursor-guard thread.
+pub fn start_cursor_guard() {
+    if GUARD_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    GUARD_STOP.store(false, Ordering::SeqCst);
+    std::thread::Builder::new()
+        .name("cursor-guard".into())
+        .spawn(cursor_guard_loop)
+        .ok();
+}
+
+/// Update the guard's desired state (called every frame):
+/// * `force` — our `HCURSOR` (as `usize`) to keep showing, or 0.
+/// * `hide`  — keep the OS cursor hidden (e.g. while writing).
+pub fn set_cursor_guard(force: usize, hide: bool) {
+    GUARD_FORCE.store(force, Ordering::Relaxed);
+    GUARD_HIDE.store(hide, Ordering::Relaxed);
+}
+
+fn cursor_guard_loop() {
+    unsafe {
+        // 1 ms timer resolution so the guard actually ticks at ~1–4 ms
+        // (Windows default sleep granularity is ~15.6 ms).
+        windows_sys::Win32::Media::timeBeginPeriod(1);
+    }
+    let period = std::time::Duration::from_millis(1);
+    while !GUARD_STOP.load(Ordering::SeqCst) {
+        std::thread::sleep(period);
+        if GUARD_HIDE.load(Ordering::Relaxed) {
+            // Keep the OS cursor hidden (deep counter) even if an app or
+            // driver re-shows it in between.
+            set_system_cursor_visible(false);
+        } else {
+            let force = GUARD_FORCE.load(Ordering::Relaxed);
+            if force != 0 {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(
+                        force as *mut core::ffi::c_void,
+                    );
+                }
+            }
+        }
+    }
+    unsafe {
+        windows_sys::Win32::Media::timeEndPeriod(1);
+    }
+}
+
+/// Stop the cursor guard (called on shutdown).
+pub fn stop_cursor_guard() {
+    GUARD_STOP.store(true, Ordering::SeqCst);
+    GUARD_FORCE.store(0, Ordering::Relaxed);
+    GUARD_HIDE.store(false, Ordering::Relaxed);
 }
