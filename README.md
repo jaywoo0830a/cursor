@@ -11,6 +11,10 @@ apps below (Windows). Outside the region the normal system cursor is used.
 
 - **Fully transparent background** by default: no settings panel and no
   region outline on startup — only the custom cursor is drawn.
+- **Works over the whole screen by default**: the region is initialized to the
+  full screen on the first frame, so the custom cursor replaces the system
+  cursor anywhere you move the mouse. Use `F1` → *Edit region* to restrict it
+  to a sub-area.
 - **Small circular custom cursor** (white circle with a dark ring), hotspot at
   the center. Replace it with your own bitmap via `assets/cursor.png`.
 - Region-limited behavior: inside the region the system cursor is hidden and
@@ -19,6 +23,10 @@ apps below (Windows). Outside the region the normal system cursor is used.
   below — only the cursor changes. Set on the window at creation time and
   kept in sync at runtime. While the settings panel / region editor is open,
   pass-through is disabled automatically so the panel stays usable.
+- **Overlay a specific window (Windows):** give a window title substring and
+  the overlay resizes to exactly cover that window and follows it as it
+  moves/resizes. This is the standard, safe way to "attach" the overlay to a
+  particular process — no DLL injection needed.
 - Optional OS-level bitmap cursor (`Context::set_cursor_image` →
   `winit::window::CustomCursor`) applied to the whole window (no click-through).
 - Interactive region editor: drag the box to move it, drag the handles to
@@ -33,6 +41,19 @@ apps below (Windows). Outside the region the normal system cursor is used.
 | Drag region box     | Move the overlay region (edit mode)       |
 | Drag region handles | Resize the overlay region (edit mode)     |
 
+While the settings panel is closed, a small status line is drawn at the top
+left of the screen:
+
+```
+F1 settings · Esc quit   |   overlay:ON · pass:ON · region:IN
+```
+
+`overlay` = custom-cursor mode active, `pass` = click pass-through on,
+`region` = whether the mouse is currently inside the overlay region. Use it
+to verify the logic: if `region:IN` is shown but no circle appears, it is a
+rendering issue; if it always says `OUT`, the pointer/region coordinates are
+misaligned.
+
 ## Build & run
 
 ```bash
@@ -46,6 +67,23 @@ apps below (Windows). Outside the region the normal system cursor is used.
 
 cargo run --release
 ```
+
+## Overlaying a specific window (Windows)
+
+Instead of covering the whole screen, you can make the overlay hug a specific
+window (e.g. a game or app). The overlay exits fullscreen, resizes to exactly
+cover the target window, and follows it when it moves or resizes.
+
+```bash
+cargo run --release -- --window "MyApp"      # title substring
+```
+
+Or set it in the settings panel (`F1` → *Overlay a specific window*).
+The window title is matched case-insensitively as a substring; minimized
+windows are ignored. When you clear the target, the overlay returns to
+fullscreen. This uses only standard Windows APIs (`EnumWindows`,
+`GetWindowTextW`, `GetWindowRect`) and `ViewportCommand::OuterPosition` /
+`InnerSize` / `Fullscreen` — no injection into the target process.
 
 ## How it works
 

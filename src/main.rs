@@ -31,13 +31,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, pos2, vec2, Color32, ColorImage, CornerRadius, CursorIcon, FontId, Id, LayerId, Order,
-    Rect, Stroke, StrokeKind, TextureHandle, TextureOptions,
+    self, pos2, vec2, Color32, ColorImage, CornerRadius, CursorIcon, FontId, Id, Rect, Stroke,
+    StrokeKind, TextureHandle, TextureOptions,
 };
 use eframe::egui::viewport::ViewportBuilder;
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Configurationvyw
 // ---------------------------------------------------------------------------
 
 /// Default overlay region (in window points, origin = top-left).
@@ -92,12 +92,83 @@ mod platform {
     }
 
     /// Hide (`false`) / show (`true`) the system cursor. `ShowCursor` uses a
-    /// global display counter, so every `false` must be paired with a `true`.
+    /// global display counter, so we force it into the desired state (other
+    /// windows may re-increment the counter).
     pub fn set_system_cursor_visible(visible: bool) {
         use windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor;
         unsafe {
-            let _ = ShowCursor(visible as i32);
+            if visible {
+                // Force the counter back up so the cursor is visible again.
+                while ShowCursor(1) < 0 {}
+            } else {
+                // Force the counter down so the cursor is hidden.
+                while ShowCursor(0) >= 0 {}
+            }
         }
+    }
+
+    // ---- target window tracking (overlay a specific process's window) ----
+
+    /// A Windows window handle (`HWND`).
+    type HWND = *mut core::ffi::c_void;
+
+    /// Find a visible, non-minimized top-level window whose title contains
+    /// `sub` (case-insensitive). Returns its `HWND`, or `None`.
+    pub fn find_window_by_title(sub: &str) -> Option<HWND> {
+        use std::cell::RefCell;
+        use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+        thread_local! {
+            static SEARCH: RefCell<String> = const { RefCell::new(String::new()) };
+            static FOUND: RefCell<HWND> = const { RefCell::new(std::ptr::null_mut()) };
+        }
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: isize) -> i32 {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowTextW, IsIconic, IsWindowVisible};
+            let search = SEARCH.with(|s| s.borrow().clone());
+            if search.is_empty() {
+                return 1;
+            }
+            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                return 1;
+            }
+            let mut buf = [0u16; 512];
+            let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            let title = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+            if title.to_lowercase().contains(&search) {
+                FOUND.with(|f| *f.borrow_mut() = hwnd);
+                return 0; // stop enumeration
+            }
+            1
+        }
+
+        SEARCH.with(|s| *s.borrow_mut() = sub.to_lowercase());
+        FOUND.with(|f| *f.borrow_mut() = std::ptr::null_mut());
+        unsafe {
+            EnumWindows(Some(enum_proc), 0);
+        }
+        let hwnd = FOUND.with(|f| *f.borrow());
+        (!hwnd.is_null()).then_some(hwnd)
+    }
+
+    /// Outer rectangle of a window, in physical screen pixels.
+    pub fn window_outer_rect(hwnd: HWND) -> Option<(i32, i32, i32, i32)> {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        unsafe {
+            let mut r = std::mem::zeroed::<RECT>();
+            if GetWindowRect(hwnd, &mut r) != 0 {
+                Some((r.left, r.top, r.right, r.bottom))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Is the window minimized?
+    pub fn is_iconic(hwnd: HWND) -> bool {
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsIconic;
+        unsafe { IsIconic(hwnd) != 0 }
     }
 }
 
@@ -109,6 +180,18 @@ mod platform {
     }
 
     pub fn set_system_cursor_visible(_visible: bool) {}
+
+    pub fn find_window_by_title(_sub: &str) -> Option<*mut core::ffi::c_void> {
+        None
+    }
+
+    pub fn window_outer_rect(_hwnd: *mut core::ffi::c_void) -> Option<(i32, i32, i32, i32)> {
+        None
+    }
+
+    pub fn is_iconic(_hwnd: *mut core::ffi::c_void) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +305,22 @@ struct CursorOverlayApp {
     /// Last pass-through value sent to the viewport (to avoid re-sending).
     last_passthrough: Option<bool>,
 
+    /// Target window title substring to overlay (Windows-only effect).
+    /// `None` = cover the whole screen.
+    target_window: Option<String>,
+    /// Text field in the settings panel for the target title.
+    target_window_input: String,
+    /// Cached HWND of the target window (0 = not found yet).
+    target_hwnd: usize,
+    /// Last known target rect in physical px (to avoid re-sending commands).
+    last_target_rect: Option<(i32, i32, i32, i32)>,
+    /// Whether we are currently following a target window (fullscreen off).
+    window_follow_active: bool,
+    /// Whether the region has been initialized to cover the target window.
+    region_initialized_for_target: bool,
+    /// Whether the region was initialized to the full screen on the first frame.
+    region_initialized: bool,
+
     drag: Option<Handle>,
     drag_start_pointer: egui::Pos2,
     drag_start_region: Rect,
@@ -248,6 +347,15 @@ impl CursorOverlayApp {
             hotspot: bitmap.hotspot,
         };
 
+        // Optional CLI: --window "<title substring>" overlays a specific
+        // window instead of the whole screen.
+        let target_window = std::env::args()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|w| w[0] == "--window")
+            .map(|w| w[1].clone());
+        let target_window_input = target_window.clone().unwrap_or_default();
+
         Self {
             ctx,
             bitmap,
@@ -269,6 +377,13 @@ impl CursorOverlayApp {
             passthrough: false,
             cursor_hidden: false,
             last_passthrough: None,
+            target_window,
+            target_window_input,
+            target_hwnd: 0,
+            last_target_rect: None,
+            window_follow_active: false,
+            region_initialized_for_target: false,
+            region_initialized: false,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
             drag_start_region: default_region(),
@@ -404,6 +519,82 @@ impl CursorOverlayApp {
         let _ = (passthrough, visible);
     }
 
+    /// Overlay a specific target window (Windows): resize the overlay to
+    /// exactly cover it and follow it when it moves or resizes. This is the
+    /// safe, standard way to "attach" the overlay to another process — no
+    /// DLL injection needed.
+    fn update_target_window(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            let Some(target) = self.target_window.clone() else {
+                // No target: go back to fullscreen if we had left it.
+                if self.window_follow_active {
+                    self.window_follow_active = false;
+                    self.region_initialized_for_target = false;
+                    self.target_hwnd = 0;
+                    self.last_target_rect = None;
+                    self.region = default_region();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+                return;
+            };
+
+            // Find (or re-find) the target window by title.
+            if self.target_hwnd == 0 {
+                self.target_hwnd = platform::find_window_by_title(&target)
+                    .map(|h| h as usize)
+                    .unwrap_or(0);
+            }
+            let hwnd = self.target_hwnd;
+            if hwnd == 0 {
+                return;
+            }
+
+            if platform::is_iconic(hwnd as *mut core::ffi::c_void) {
+                return; // minimized — leave the overlay where it is
+            }
+
+            match platform::window_outer_rect(hwnd as *mut core::ffi::c_void) {
+                Some((l, t, r, b)) => {
+                    let rect = (l, t, r, b);
+                    if !self.window_follow_active {
+                        self.window_follow_active = true;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                    }
+                    if self.last_target_rect != Some(rect) {
+                        self.last_target_rect = Some(rect);
+                        let ppp = ctx.pixels_per_point();
+                        let pos = egui::pos2(l as f32 / ppp, t as f32 / ppp);
+                        let size = egui::vec2((r - l) as f32 / ppp, (b - t) as f32 / ppp);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                        if !self.region_initialized_for_target {
+                            // Default: cover the whole target window.
+                            self.region_initialized_for_target = true;
+                            self.region = Rect::from_min_size(egui::Pos2::ZERO, size);
+                        }
+                    }
+                }
+                None => {
+                    // Target closed / invalid — re-find it next frame.
+                    self.target_hwnd = 0;
+                    self.last_target_rect = None;
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (
+                &self.target_window,
+                &self.target_hwnd,
+                &self.last_target_rect,
+                &self.window_follow_active,
+                &self.region_initialized_for_target,
+                ctx,
+            );
+        }
+    }
+
     /// Draw the region rectangle (+ handles while editing).
     fn paint_region(&self, ui: &mut egui::Ui) {
         // In run mode the outline is optional (toggle in the settings).
@@ -442,7 +633,8 @@ impl CursorOverlayApp {
         }
     }
 
-    /// Paint the custom cursor at `pointer` (hotspot-corrected), on a top layer.
+    /// Paint the custom cursor at `pointer` (hotspot-corrected) on the
+    /// topmost debug layer, so nothing can cover it.
     fn paint_custom_cursor(&self, ctx: &egui::Context, pointer: egui::Pos2) {
         let (w, h) = (self.bitmap.size[0] as f32, self.bitmap.size[1] as f32);
         let scale = CURSOR_DISPLAY_SIZE / w;
@@ -450,8 +642,7 @@ impl CursorOverlayApp {
         let hotspot = vec2(self.bitmap.hotspot[0] as f32, self.bitmap.hotspot[1] as f32) * scale;
         let rect = Rect::from_min_size(pointer - hotspot, size);
 
-        let layer = LayerId::new(Order::Tooltip, Id::new("custom_cursor"));
-        let painter = ctx.layer_painter(layer);
+        let painter = ctx.debug_painter(); // topmost layer, always rendered
         painter.image(
             self.texture.id(),
             rect,
@@ -495,6 +686,32 @@ impl CursorOverlayApp {
                     );
                 ui.separator();
 
+                // ---- overlay a specific window (Windows) ----
+                ui.label("Overlay a specific window (Windows):");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.target_window_input)
+                            .hint_text("window title substring, empty = whole screen")
+                            .desired_width(210.0),
+                    );
+                    if ui.button("Apply").clicked() {
+                        let s = self.target_window_input.trim();
+                        self.target_window = (!s.is_empty()).then(|| s.to_owned());
+                        self.target_hwnd = 0;
+                        self.last_target_rect = None;
+                        self.region_initialized_for_target = false;
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.target_window = None;
+                        self.target_window_input.clear();
+                        self.target_hwnd = 0;
+                        self.last_target_rect = None;
+                        self.region_initialized_for_target = false;
+                        self.region = default_region();
+                    }
+                });
+                ui.separator();
+
                 let r = self.region;
                 ui.monospace(format!(
                     "region: x={:.0}..{:.0}  y={:.0}..{:.0}\n\
@@ -509,7 +726,11 @@ impl CursorOverlayApp {
 
                 ui.horizontal(|ui| {
                     if ui.button("Reset").clicked() {
-                        self.region = default_region();
+                        if let Some(screen) = self.screen_rect() {
+                            self.region = screen;
+                        } else {
+                            self.region = default_region();
+                        }
                     }
                     if ui.button("Center").clicked() {
                         if let Some(screen) = self.screen_rect() {
@@ -562,6 +783,19 @@ impl eframe::App for CursorOverlayApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+
+        // ---- first frame: default the region to the whole screen so the
+        // custom cursor is visible everywhere until a sub-region is defined.
+        if !self.region_initialized {
+            self.region_initialized = true;
+            let full = ctx.viewport_rect();
+            if full.width() > 0.0 && full.height() > 0.0 {
+                self.region = full;
+            }
+        }
+
+        // ---- follow a target window, if configured (Windows) ----
+        self.update_target_window(&ctx);
 
         // ---- overlay mode ----
         // The region-limited custom cursor runs in "overlay mode". On Windows
@@ -626,15 +860,21 @@ impl eframe::App for CursorOverlayApp {
             self.set_system_cursor_visible(false, true); // restore OS cursor
         }
 
-        // ---- subtle hint while the panel is closed ----
-        if !self.show_settings && !self.editing {
-            let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("hint")));
+        // ---- live status line (lets you verify what the overlay is doing) ----
+        if !self.show_settings {
+            let status = format!(
+                "F1 settings · Esc quit   |   overlay:{} · pass:{} · region:{}",
+                if overlay_on { "ON" } else { "off" },
+                if passthrough { "ON" } else { "off" },
+                if in_region { "IN" } else { "OUT" },
+            );
+            let painter = ctx.debug_painter();
             painter.text(
                 egui::pos2(8.0, 6.0),
                 egui::Align2::LEFT_TOP,
-                "F1: settings  ·  Esc: quit",
+                status,
                 FontId::proportional(11.0),
-                Color32::from_gray(210).gamma_multiply(0.35),
+                Color32::from_gray(220).gamma_multiply(0.6),
             );
         }
 
@@ -715,6 +955,11 @@ fn main() -> eframe::Result {
 
     let renderer = select_renderer();
     log::info!("Using the {renderer:?} renderer");
+    #[cfg(target_os = "windows")]
+    eprintln!("custom-cursor-overlay: renderer={renderer:?}, click pass-through supported");
+    #[cfg(not(target_os = "windows"))]
+    eprintln!("custom-cursor-overlay: renderer={renderer:?} (click pass-through is Windows-only)");
+    eprintln!("custom-cursor-overlay: F1 = settings panel, Esc = quit");
 
     let viewport = ViewportBuilder::default()
         .with_app_id("custom_cursor_overlay")
