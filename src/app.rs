@@ -96,12 +96,14 @@ pub struct CursorOverlayApp {
     /// hysteresis so a brief glitch (e.g. a drawing-pad pen touch) doesn't
     /// disable the forced circle.
     out_region_frames: u32,
-    /// Last time the system-cursor swap was re-asserted (Windows).
+    /// Last time the system-cursor swap was re-asserted (Windows, ~2 Hz
+    /// safety net while hovering).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     last_swap_reassert: std::time::Instant,
-    /// Last time just the arrow (`OCR_NORMAL`) was re-asserted (Windows).
+    /// Whether the pen was writing last frame (to re-assert the swap on the
+    /// pen-up transition).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    last_normal_reassert: std::time::Instant,
+    was_writing: bool,
     /// While the pen is down (writing), hide the OS cursor entirely and paint
     /// our circle instead — this blocks cursor flicker at the source.
     hide_cursor_while_writing: bool,
@@ -213,7 +215,7 @@ impl CursorOverlayApp {
             raw,
             out_region_frames: 0,
             last_swap_reassert: std::time::Instant::now(),
-            last_normal_reassert: std::time::Instant::now(),
+            was_writing: false,
             hide_cursor_while_writing: true,
             drag: None,
             drag_start_pointer: egui::Pos2::ZERO,
@@ -624,8 +626,7 @@ impl CursorOverlayApp {
                     ui.weak(
                         "Pen / touch / trackpad are captured raw via HID raw input\n\
                          (pen 0x0D/0x02, touch 0x0D/0x04, touch pad 0x0D/0x05);\n\
-                         pressure/tilt are best-effort decodes. Events are\n\
-                         debounced (~1 ms) for performance.",
+                         pressure/tilt are best-effort decodes of the HID report.",
                     );
                 } else {
                     ui.weak("Raw input is only available on Windows.");
@@ -659,19 +660,8 @@ impl eframe::App for CursorOverlayApp {
         let ctx = ui.ctx().clone();
 
         // ---- drain raw low-level input events (mouse / pen / touch) ----
-        #[cfg_attr(not(target_os = "windows"), allow(unused_variables, unused_assignments, unused_mut))]
-        let mut raw_pointer = false;
         if let Some(rx) = &self.raw_rx {
             while let Ok(ev) = rx.try_recv() {
-                #[cfg(target_os = "windows")]
-                if matches!(
-                    &ev,
-                    InputEvent::Pen { .. }
-                        | InputEvent::Touch { .. }
-                        | InputEvent::Touchpad { .. }
-                ) {
-                    raw_pointer = true;
-                }
                 self.raw.apply(&ev);
             }
         }
@@ -755,24 +745,11 @@ impl eframe::App for CursorOverlayApp {
         // While the pen is down inside the region we "write" with it. To
         // block the cursor flicker at the source, the OS cursor is fully
         // hidden during writing and our circle is painted instead (see the
-        // os_mode branch below).
+        // os_mode branch below) — no cursor re-assertion fights while writing.
         let pen_writing = self.hide_cursor_while_writing
             && os_mode
             && in_region_eff
             && self.raw.pen.is_some_and(|c| c.down);
-
-        // Re-assert the custom circle from the global mouse hook on every
-        // mouse event (Windows), so apps that set their own cursor — e.g. an
-        // I-beam while typing or a hand while hovering — still show our
-        // circle. Only active in OS mode while the pointer is inside the
-        // region (and not while writing, where the OS cursor is hidden).
-        input::set_forced_cursor(
-            if os_mode && in_region_eff && !pen_writing && self.hcursor != 0 {
-                Some(self.hcursor)
-            } else {
-                None
-            },
-        );
 
         if os_mode {
             // OS bitmap cursor (region-limited). On Windows the system cursor
@@ -793,23 +770,18 @@ impl eframe::App for CursorOverlayApp {
                         platform::set_system_cursor_visible(true);
                         self.cursor_hidden = false;
                     }
-                    platform::set_system_cursor_active(in_region_eff, self.hcursor);
-                    // Re-assert just the arrow at high rate (~60 Hz) so a
-                    // driver revert — which flashes the system arrow — is
-                    // undone within a single frame.
-                    if self.last_normal_reassert.elapsed()
-                        >= std::time::Duration::from_millis(16)
-                    {
-                        self.last_normal_reassert = std::time::Instant::now();
-                        platform::reassert_normal_cursor_swap();
+                    // Writing just ended: the driver may have reverted the
+                    // system cursors while it was hidden — re-apply once so
+                    // the circle is back immediately.
+                    if self.was_writing {
+                        platform::reassert_system_cursor_swap();
                     }
-                    // Some tablet drivers revert the system cursors (e.g. via
-                    // SPI_SETCURSORS) the instant the pen touches; re-apply
-                    // the full swap immediately on pen/touch events and
-                    // periodically so the circle always comes back.
-                    if raw_pointer
-                        || self.last_swap_reassert.elapsed()
-                            >= std::time::Duration::from_millis(250)
+                    platform::set_system_cursor_active(in_region_eff, self.hcursor);
+                    // Low-cost safety net (~2 Hz): if anything reverts the
+                    // swap while hovering, the circle returns within 500 ms.
+                    if in_region_eff
+                        && self.last_swap_reassert.elapsed()
+                            >= std::time::Duration::from_millis(500)
                     {
                         self.last_swap_reassert = std::time::Instant::now();
                         platform::reassert_system_cursor_swap();
@@ -866,6 +838,9 @@ impl eframe::App for CursorOverlayApp {
             self.set_system_cursor_visible(false, true); // restore OS cursor
         }
 
+        // Remember the writing state for the pen-up transition next frame.
+        self.was_writing = pen_writing;
+
         // ---- live status line (lets you verify what the overlay is doing) ----
         if !self.show_settings {
             let device = if self.raw.last_device.is_empty() {
@@ -903,9 +878,8 @@ impl eframe::App for CursorOverlayApp {
 
 impl Drop for CursorOverlayApp {
     fn drop(&mut self) {
-        // Never leave the system cursor hidden or forced.
+        // Never leave the system cursor hidden.
         self.set_system_cursor_visible(true, true);
-        input::set_forced_cursor(None);
         #[cfg(target_os = "windows")]
         if self.hcursor != 0 {
             // Restore the original system cursors, then free our HCURSOR.

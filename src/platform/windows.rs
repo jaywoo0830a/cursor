@@ -358,26 +358,6 @@ pub fn reassert_system_cursor_swap() {
     }
 }
 
-/// Re-apply just the normal arrow cursor (`OCR_NORMAL`) — the one tablet
-/// drivers most often revert and the one the user sees flash. Called at a
-/// high rate (~60 Hz) so a revert is undone within a single frame.
-pub fn reassert_normal_cursor_swap() {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{CopyIcon, SetSystemCursor, OCR_NORMAL};
-    let guard = sys_cursor().lock().unwrap();
-    let Some(state) = guard.as_ref() else {
-        return;
-    };
-    if !state.active {
-        return;
-    }
-    unsafe {
-        let copy = CopyIcon(state.custom as *mut core::ffi::c_void);
-        if !copy.is_null() {
-            SetSystemCursor(copy, OCR_NORMAL);
-        }
-    }
-}
-
 /// Restore all system cursors (from the registry) and free our saved copies.
 /// Called on shutdown.
 pub fn restore_system_cursor_swap() {

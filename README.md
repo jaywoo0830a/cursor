@@ -40,10 +40,8 @@ apps below (Windows). Outside the region the normal system cursor is used.
   * **Pen (터치펜) / touch / trackpad** — HID raw input is registered for the
     digitizer usages (pen `0x0D/0x02`, touch `0x0D/0x04`, touch pad
     `0x0D/0x05`) and reports are decoded best-effort (contact, x/y,
-    pressure, tilt).
-  * **Debounced (~1 ms):** events are coalesced (latest state, summed
-    deltas) and flushed by a dedicated thread, so high-rate HID devices
-    don't flood the app. Live state is shown in the settings panel (F1).
+    pressure, tilt); raw bytes are also exposed. Live state is shown in the
+    settings panel (F1).
 - Region-limited behavior: inside the region the system cursor is replaced by
   the custom cursor; outside it the normal system cursor is used.
 - **Overlay a specific window (Windows):** give a window title substring and
