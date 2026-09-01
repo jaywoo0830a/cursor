@@ -556,17 +556,17 @@ impl App {
     fn status_text(&self, owning: bool, pen_active: bool) -> String {
         let t = self.target_window.clone().unwrap_or_default();
         let mode = if self.editing {
-            "영역편집"
+            "EDITING"
         } else if pen_active {
-            "펜"
+            "PEN"
         } else if owning {
-            "커서"
+            "CURSOR"
         } else {
-            "대기"
+            "IDLE"
         };
         let on = if self.enabled { "ON" } else { "OFF" };
         format!(
-            "[{t}] {mode} {on}  |  Ctrl+Shift C:on/off R:영역 O:윤곽 0:전체 Q:종료 Esc:종료"
+            "[{t}] {mode} {on}  |  Ctrl+Shift C:on/off R:edit O:outline 0:full Q:quit Esc:quit"
         )
     }
 }

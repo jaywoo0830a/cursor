@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     log::info!(
-        "overlay ready — hotkeys: Ctrl+Shift C(on/off) R(영역편집) O(윤곽) 0(전체) Q(종료), Esc(종료)"
+        "overlay ready - hotkeys: Ctrl+Shift C(on/off) R(edit region) O(outline) 0(full window) Q(quit), Esc(quit)"
     );
 
     event_loop.run(move |event, _target, control_flow| {

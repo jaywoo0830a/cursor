@@ -9,10 +9,11 @@
 //!   move / button / wheel event together with its global position, and raw
 //!   input (`WM_INPUT`) delivers high-frequency relative deltas
 //!   (`RAWINPUT`).
-//! * **Pen (터치펜) / touch / trackpad** — raw input is registered for the
-//!   HID digitizer usages (pen `0x0D/0x02`, touch screen `0x0D/0x04`, touch
-//!   pad `0x0D/0x05`). Every `WM_INPUT` HID report is decoded best-effort
-//!   (contact, x/y, pressure, tilt).
+//! * **Drawing-pad pen / touch screen** — raw input is registered for the
+//!   HID digitizer usages (pen `0x0D/0x02`, touch screen `0x0D/0x04`). Every
+//!   `WM_INPUT` HID report is decoded best-effort (contact, x/y, pressure,
+//!   tilt), so the pen's **pressure** drives pen-mode switching. (Trackpad
+//!   `0x0D/0x05` is intentionally not registered.)
 //!
 //! All events are **debounced (~1 ms)**: the hook/raw-input handlers merge
 //! them into a small accumulator (latest position/state, summed deltas) and a
@@ -71,12 +72,6 @@ pub enum InputEvent {
     Pen { contact: Contact },
     /// HID touch screen (0x0D/0x04).
     Touch { contact: Contact },
-    /// HID touch pad / precision trackpad (0x0D/0x05).
-    Touchpad {
-        contact: Contact,
-        dx: i32,
-        dy: i32,
-    },
     /// Any other HID report with its raw bytes (device-specific).
     HidRaw {
         usage_page: u16,
@@ -95,8 +90,6 @@ pub struct InputSnapshot {
     pub wheel: i32,
     pub pen: Option<Contact>,
     pub touch: Option<Contact>,
-    pub touchpad: Option<Contact>,
-    pub touchpad_delta: (i64, i64),
     pub hid_reports: u64,
     pub last_device: &'static str,
 }
@@ -135,16 +128,6 @@ impl InputSnapshot {
             InputEvent::Touch { contact } => {
                 self.touch = Some(*contact);
                 self.last_device = "touch";
-            }
-            InputEvent::Touchpad {
-                contact,
-                dx,
-                dy,
-            } => {
-                self.touchpad = Some(*contact);
-                self.touchpad_delta.0 += *dx as i64;
-                self.touchpad_delta.1 += *dy as i64;
-                self.last_device = "touchpad";
             }
             InputEvent::HidRaw { .. } => {
                 self.hid_reports += 1;
@@ -248,7 +231,6 @@ mod win {
     const HID_USAGE_PAGE_DIGITIZER: u16 = 0x0D;
     const HID_USAGE_DIGITIZER_PEN: u16 = 0x02;
     const HID_USAGE_DIGITIZER_TOUCH_SCREEN: u16 = 0x04;
-    const HID_USAGE_DIGITIZER_TOUCH_PAD: u16 = 0x05;
 
     pub fn start() -> Option<Receiver<InputEvent>> {
         let (tx, rx) = mpsc::channel();
@@ -332,7 +314,6 @@ mod win {
         button: Option<(bool, bool, bool)>,
         pen: Option<Contact>,
         touch: Option<Contact>,
-        touchpad: Option<(Contact, i32, i32)>,
         hid_reports: u64,
     }
 
@@ -347,7 +328,6 @@ mod win {
                 button: None,
                 pen: None,
                 touch: None,
-                touchpad: None,
                 hid_reports: 0,
             }
         }
@@ -372,9 +352,6 @@ mod win {
         }
         fn touch(&mut self, c: Contact) {
             self.touch = Some(c);
-        }
-        fn touchpad(&mut self, c: Contact, dx: i32, dy: i32) {
-            self.touchpad = Some((c, dx, dy));
         }
         fn hid(&mut self) {
             self.hid_reports += 1;
@@ -409,9 +386,6 @@ mod win {
             }
             if let Some(c) = self.touch.take() {
                 out.push(InputEvent::Touch { contact: c });
-            }
-            if let Some((c, dx, dy)) = self.touchpad.take() {
-                out.push(InputEvent::Touchpad { contact: c, dx, dy });
             }
             if self.hid_reports > 0 {
                 // Raw HID reports are counted (not forwarded byte-for-byte).
@@ -468,7 +442,7 @@ mod win {
     /// global position, and — when the overlay owns the hit-testing —
     /// forwards EVERYTHING to the app below so it behaves as if the real
     /// cursor were there: hover, drags, middle/X buttons, vertical AND
-    /// horizontal wheel, touchpad-generated scroll, etc.
+    /// horizontal wheel, etc.
     unsafe extern "system" fn mouse_ll_hook(code: i32, wparam: usize, lparam: isize) -> isize {
         if code >= 0 {
             let m = &*(lparam as *const wam::MSLLHOOKSTRUCT);
@@ -549,7 +523,7 @@ mod win {
 
     /// Enumerate raw input devices and build a map `hDevice -> (usagePage,
     /// usage)` so `WM_INPUT` HID reports can be classified as pen / touch /
-    /// touchpad / other.
+    /// other.
     fn enumerate_devices() -> std::collections::HashMap<usize, (u16, u16)> {
         let mut map = std::collections::HashMap::new();
         unsafe {
@@ -645,12 +619,6 @@ mod win {
                 kbm::RAWINPUTDEVICE {
                     usUsagePage: HID_USAGE_PAGE_DIGITIZER,
                     usUsage: HID_USAGE_DIGITIZER_TOUCH_SCREEN,
-                    dwFlags: kbm::RIDEV_INPUTSINK,
-                    hwndTarget: std::ptr::null_mut(),
-                },
-                kbm::RAWINPUTDEVICE {
-                    usUsagePage: HID_USAGE_PAGE_DIGITIZER,
-                    usUsage: HID_USAGE_DIGITIZER_TOUCH_PAD,
                     dwFlags: kbm::RIDEV_INPUTSINK,
                     hwndTarget: std::ptr::null_mut(),
                 },
@@ -781,13 +749,6 @@ mod win {
                         HID_USAGE_DIGITIZER_TOUCH_SCREEN => {
                             if let Some(c) = decode_contact(bytes) {
                                 coalesce().touch(c);
-                            }
-                        }
-                        HID_USAGE_DIGITIZER_TOUCH_PAD => {
-                            if let Some(c) = decode_contact(bytes) {
-                                // Touch pads report absolute contact positions;
-                                // relative motion arrives as RawMouse deltas.
-                                coalesce().touchpad(c, 0, 0);
                             }
                         }
                         _ => coalesce().hid(),
