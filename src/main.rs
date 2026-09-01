@@ -367,7 +367,7 @@ impl CursorOverlayApp {
             show_settings: false,
             editing: false,
             enabled: true,
-            use_os_cursor: false,
+            use_os_cursor: true, // OS bitmap cursor image is the reliable default
             show_region_visual: false,
             // Click pass-through is only implemented on Windows (global
             // cursor polling via GetCursorPos).
@@ -668,20 +668,20 @@ impl CursorOverlayApp {
 
                 ui.checkbox(&mut self.enabled, "Enable custom cursor");
                 ui.checkbox(&mut self.editing, "Edit region (drag / resize)");
-                ui.checkbox(
-                    &mut self.use_os_cursor,
-                    "Use OS bitmap cursor (whole window, native)",
-                )
-                .on_hover_text(
-                    "Registers the bitmap as a real OS cursor via winit.\n\
-                     Applies to the whole window, not just the region.\n\
-                     Disabled while click pass-through is active.",
-                );
+                ui.checkbox(&mut self.use_os_cursor, "Use OS bitmap cursor image")
+                    .on_hover_text(
+                        "Registers the cursor bitmap as a real OS cursor\n\
+                         (winit CustomCursor). Very reliable — the OS draws it.\n\
+                         Requires the window to receive cursor messages, so\n\
+                         click pass-through is disabled in this mode.",
+                    );
                 ui.checkbox(&mut self.show_region_visual, "Show region outline");
                 #[cfg(target_os = "windows")]
                 ui.checkbox(&mut self.passthrough, "Click pass-through (mouse)")
                     .on_hover_text(
                         "Clicks pass through the overlay to the apps below.\n\
+                         Only effective with the painted cursor\n\
+                         (i.e. when 'Use OS bitmap cursor image' is off).\n\
                          Uses global cursor tracking (GetCursorPos).",
                     );
                 ui.separator();
@@ -798,15 +798,23 @@ impl eframe::App for CursorOverlayApp {
         self.update_target_window(&ctx);
 
         // ---- overlay mode ----
-        // The region-limited custom cursor runs in "overlay mode". On Windows
-        // this is only fully correct with click pass-through enabled: the
-        // system cursor is hidden/shown per-region via ShowCursor and the
-        // position is polled with GetCursorPos. While the settings panel or
-        // region editor is open, pass-through is disabled so the panel stays
-        // interactive and the normal system cursor is used.
+        // Two ways to show the custom cursor:
+        //  * OS bitmap cursor (default): a real OS cursor image registered
+        //    with `Context::set_cursor_image` (winit `CustomCursor`). Windows
+        //    draws it, so it is visible regardless of our rendering. It needs
+        //    the window to receive cursor messages, so click pass-through is
+        //    disabled in this mode.
+        //  * Painted cursor: drawn by egui on the topmost layer. Supports
+        //    click pass-through on Windows (the system cursor is hidden
+        //    per-region via ShowCursor and the position is polled via
+        //    GetCursorPos).
+        // While the settings panel or region editor is open, the overlay is
+        // paused and the normal system cursor is used.
         let overlay_on = self.enabled && !self.editing && !self.show_settings;
+        let os_mode = self.use_os_cursor && overlay_on;
+
         #[cfg(target_os = "windows")]
-        let passthrough = self.passthrough && overlay_on;
+        let passthrough = self.passthrough && overlay_on && !os_mode;
         #[cfg(not(target_os = "windows"))]
         let passthrough = false;
 
@@ -829,9 +837,18 @@ impl eframe::App for CursorOverlayApp {
         // ---- custom cursor behavior ----
         let in_region = pointer.is_some_and(|p| self.region.contains(p));
 
-        if overlay_on && passthrough {
-            // Region-limited custom cursor (Windows click-through path):
-            // hide the system cursor only inside the region and draw ours.
+        if os_mode {
+            // Real OS cursor image, region-limited by toggling it on/off.
+            if in_region {
+                ctx.set_cursor_image(Some(self.os_cursor.clone()));
+            } else {
+                ctx.set_cursor_image(None);
+            }
+            ctx.set_cursor_icon(CursorIcon::Default);
+            self.set_system_cursor_visible(false, true);
+        } else if overlay_on && passthrough {
+            // Painted cursor with click pass-through (Windows): hide the
+            // system cursor only inside the region and draw ours.
             if in_region {
                 self.set_system_cursor_visible(true, false); // ShowCursor(FALSE)
                 if let Some(p) = pointer {
@@ -840,14 +857,8 @@ impl eframe::App for CursorOverlayApp {
             } else {
                 self.set_system_cursor_visible(true, true); // ShowCursor(TRUE)
             }
-        } else if overlay_on && self.use_os_cursor {
-            // Native OS-level bitmap cursor (no click-through).
-            ctx.set_cursor_image(Some(self.os_cursor.clone()));
-            ctx.set_cursor_icon(CursorIcon::Default);
-            self.set_system_cursor_visible(false, true);
         } else if overlay_on && in_region {
-            // Fallback without click-through (e.g. non-Windows): hide the
-            // cursor over the whole window and paint the custom cursor.
+            // Painted cursor without click pass-through (fallback).
             ctx.set_cursor_icon(CursorIcon::None);
             if let Some(p) = pointer {
                 self.paint_custom_cursor(&ctx, p);
@@ -863,8 +874,8 @@ impl eframe::App for CursorOverlayApp {
         // ---- live status line (lets you verify what the overlay is doing) ----
         if !self.show_settings {
             let status = format!(
-                "F1 settings · Esc quit   |   overlay:{} · pass:{} · region:{}",
-                if overlay_on { "ON" } else { "off" },
+                "F1 settings · Esc quit   |   cursor:{} · pass:{} · region:{}",
+                if os_mode { "IMG" } else { "PAINT" },
                 if passthrough { "ON" } else { "off" },
                 if in_region { "IN" } else { "OUT" },
             );

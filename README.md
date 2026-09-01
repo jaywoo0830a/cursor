@@ -17,18 +17,24 @@ apps below (Windows). Outside the region the normal system cursor is used.
   to a sub-area.
 - **Small circular custom cursor** (white circle with a dark ring), hotspot at
   the center. Replace it with your own bitmap via `assets/cursor.png`.
-- Region-limited behavior: inside the region the system cursor is hidden and
-  replaced by the custom cursor; outside it the normal system cursor is used.
-- **Click pass-through (Windows):** clicks go through the overlay to the apps
-  below — only the cursor changes. Set on the window at creation time and
-  kept in sync at runtime. While the settings panel / region editor is open,
-  pass-through is disabled automatically so the panel stays usable.
+- **OS bitmap cursor image by default**: the circle is registered as a real
+  OS cursor (`Context::set_cursor_image` → winit `CustomCursor`), so Windows
+  itself draws it — very reliable, independent of our rendering/transparency.
+  It is region-limited by enabling/disabling it as the mouse enters/leaves the
+  region. This mode disables click pass-through (the window must receive
+  cursor messages).
+- Region-limited behavior: inside the region the system cursor is replaced by
+  the custom cursor; outside it the normal system cursor is used.
+- **Click pass-through (Windows, painted-cursor mode):** if you turn *Off*
+  the OS bitmap cursor, the custom cursor is painted by egui and click
+  pass-through becomes available (clicks go to the apps below, the cursor
+  position is polled with `GetCursorPos`, and the system cursor is hidden with
+  `ShowCursor`). While the settings panel / region editor is open, the overlay
+  is paused automatically so the panel stays usable.
 - **Overlay a specific window (Windows):** give a window title substring and
   the overlay resizes to exactly cover that window and follows it as it
   moves/resizes. This is the standard, safe way to "attach" the overlay to a
   particular process — no DLL injection needed.
-- Optional OS-level bitmap cursor (`Context::set_cursor_image` →
-  `winit::window::CustomCursor`) applied to the whole window (no click-through).
 - Interactive region editor: drag the box to move it, drag the handles to
   resize it. Presets: Reset / Center / Fullscreen.
 
@@ -45,14 +51,14 @@ While the settings panel is closed, a small status line is drawn at the top
 left of the screen:
 
 ```
-F1 settings · Esc quit   |   overlay:ON · pass:ON · region:IN
+F1 settings · Esc quit   |   cursor:IMG · pass:off · region:IN
 ```
 
-`overlay` = custom-cursor mode active, `pass` = click pass-through on,
-`region` = whether the mouse is currently inside the overlay region. Use it
-to verify the logic: if `region:IN` is shown but no circle appears, it is a
-rendering issue; if it always says `OUT`, the pointer/region coordinates are
-misaligned.
+`cursor:IMG` = OS bitmap cursor (default), `cursor:PAINT` = egui-painted
+cursor, `pass` = click pass-through on, `region` = whether the mouse is
+currently inside the overlay region. Use it to verify the logic: if
+`region:IN` is shown but no circle appears, it is a rendering issue; if it
+always says `OUT`, the pointer/region coordinates are misaligned.
 
 ## Build & run
 
