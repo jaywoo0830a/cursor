@@ -24,10 +24,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 env_logger = "0.11"
 
-# Windows: global cursor position (GetCursorPos) + system cursor visibility
-# (ShowCursor) + direct click pass-through (WS_EX_TRANSPARENT).
+# Windows: raw Win32 API via windows-sys — global cursor (GetCursorPos /
+# ShowCursor), real HCURSOR + system cursor swap (SetSystemCursor),
+# click pass-through (WS_EX_TRANSPARENT), low-level input (WH_MOUSE_LL hook
+# + RegisterRawInputDevices / WM_INPUT for mouse, pen, touch and trackpad).
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input"] }
 raw-window-handle = "0.6"
 
 [profile.release]

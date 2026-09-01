@@ -21,16 +21,24 @@ apps below (Windows). Outside the region the normal system cursor is used.
 - **OS bitmap cursor by default** — Windows draws the cursor itself, so it is
   visible over *any* app, including GPU/DirectComposition canvases such as
   PDF viewers where the system cursor would otherwise be covered or
-  overridden. The circle is registered as a real OS cursor
-  (`Context::set_cursor_image` → winit `CustomCursor`) **and** re-applied with
-  a direct `SetCursor` every frame, so apps that set their own cursor cannot
-  hide ours. This mode disables click pass-through (the window must receive
-  cursor messages).
-- **Click pass-through (painted mode, optional):** turn *Off* *Use OS bitmap
-  cursor image* and the custom cursor is drawn by egui on the topmost layer,
-  the system cursor is hidden with `ShowCursor` (re-applied every frame), the
-  pointer is polled with `GetCursorPos`, and clicks pass through to the apps
-  below (enforced with `WS_EX_TRANSPARENT`).
+  overridden. On Windows the *system cursor bitmaps* (`OCR_NORMAL`, I-beam,
+  hand, …) are swapped with our circle via `SetSystemCursor` while the
+  pointer is inside the region, so apps that switch cursors still show ours —
+  and, crucially, this now works **together with click pass-through**.
+- **Click pass-through (both modes):** clicks pass through the overlay to the
+  apps below — either with the OS bitmap cursor (system cursor swap) or with
+  the egui-painted cursor (`ShowCursor` hiding). Enforced directly with
+  `WS_EX_TRANSPARENT` (`SetWindowLongPtrW`).
+- **Low-level raw input (Windows):** a background thread runs its own Win32
+  message loop and captures, via raw Win32 API (`windows-sys`):
+  * **Mouse** — a global `WH_MOUSE_LL` hook (move / buttons / wheel with
+    global position) plus high-frequency relative deltas from raw input
+    (`WM_INPUT` → `GetRawInputData`).
+  * **Pen (터치펜) / touch / trackpad** — HID raw input is registered for the
+    digitizer usages (pen `0x0D/0x02`, touch `0x0D/0x04`, touch pad
+    `0x0D/0x05`) and reports are decoded best-effort (contact, x/y,
+    pressure, tilt); raw bytes are also exposed. Live state is shown in the
+    settings panel (F1).
 - Region-limited behavior: inside the region the system cursor is replaced by
   the custom cursor; outside it the normal system cursor is used.
 - **Overlay a specific window (Windows):** give a window title substring and
@@ -53,15 +61,16 @@ While the settings panel is closed, a small status line is drawn at the top
 left of the screen:
 
 ```
-F1 settings · Esc quit   |   cursor:IMG · pass:off · region:IN
+F1 settings · Esc quit   |   cursor:IMG · pass:ON · region:IN · in:pen
 ```
 
-`cursor:IMG` = OS bitmap cursor (default, reliable, no pass-through),
-`cursor:PAINT` = egui-painted cursor (supports pass-through), `pass` = click
-pass-through on, `region` = whether the mouse is currently inside the overlay
-region. Use it to verify the logic: if `region:IN` is shown but no circle
-appears, it is a rendering issue; if it always says `OUT`, the pointer/region
-coordinates are misaligned.
+`cursor:IMG` = OS bitmap cursor (default, reliable, works with pass-through),
+`cursor:PAINT` = egui-painted cursor, `pass` = click pass-through on,
+`region` = whether the mouse is currently inside the overlay region,
+`in` = last raw input device seen (mouse / pen / touch / touchpad). Use it to
+verify the logic: if `region:IN` is shown but no circle appears, it is a
+rendering issue; if it always says `OUT`, the pointer/region coordinates are
+misaligned.
 
 ## Build & run
 
@@ -111,11 +120,16 @@ fullscreen. This uses only standard Windows APIs (`EnumWindows`,
    - the custom bitmap cursor is painted at the pointer position on a top
      layer (`Painter::image`), offset by its hotspot.
 4. Outside the region the system cursor is restored (`ShowCursor(TRUE)` /
-   `CursorIcon::Default`).
-5. Optional native mode: `ctx.set_cursor_image(Some(CustomCursorImage { .. }))`
+   `CursorIcon::Default` / `SetSystemCursor` swap back).
+5. Native OS mode: `ctx.set_cursor_image(Some(CustomCursorImage { .. }))`
    registers the RGBA bitmap as a real OS cursor (`egui::CustomCursorImage`),
-   which is not clipped by the window — but applies to the whole window and is
-   disabled while click pass-through is active.
+   and on Windows the system cursor bitmaps are swapped with `SetSystemCursor`
+   while the pointer is inside the region. Because the bitmap lives in the
+   *system* cursor, it works over any app **and** together with click
+   pass-through.
+6. Raw input: a background thread runs a Win32 message loop (`WH_MOUSE_LL`
+   hook + `RegisterRawInputDevices`/`WM_INPUT`) and pushes mouse / pen /
+   touch / trackpad events to the app every frame.
 
 Key egui 0.36 APIs used:
 
@@ -127,8 +141,9 @@ Key egui 0.36 APIs used:
 ## Customizing the cursor image
 
 Drop a straight-RGBA PNG at `assets/cursor.png` (default hotspot `[0, 0]`,
-editable via `PNG_HOTSPOT` in `src/main.rs`). Keep it small (e.g. 32×32).
-If the file is absent, a small circular cursor is generated automatically.
+editable via `PNG_HOTSPOT` in `src/config.rs`). Keep it small (e.g. 32×32).
+If the file is absent, a small precision-reticle cursor is generated
+automatically (`make_default_cursor` in `src/cursor.rs`).
 
 ## Notes & limitations
 
@@ -156,6 +171,30 @@ If the file is absent, a small circular cursor is generated automatically.
   balanced, and the cursor is always restored on exit.
 - Transparency requires a compositor on Linux/X11 (e.g. picom, Mutter), and
   works with both the glow and wgpu backends on Windows.
-- The OS-level bitmap cursor mode (`use_os_cursor`) applies to the entire
-  window, not only the region — that is a limitation of the OS cursor API.
+- The OS bitmap cursor mode is **region-limited** on Windows: the system
+  cursor bitmaps are swapped with `SetSystemCursor` while the pointer is
+  inside the region and restored outside it. While active it replaces those
+  system cursors *globally* (the cursor bitmap shown inside the region is
+  the same everywhere, because there is only one system cursor).
+- The HID pen/touch/trackpad report decode in `src/input.rs` is best-effort:
+  Windows HID digitizer layouts vary by device, so use the raw report bytes
+  (`InputEvent::HidRaw`) as the authoritative source if needed.
 - The example was built with rustc 1.98.0; egui 0.36.1 needs rustc ≥ 1.95.
+
+## Project structure
+
+```
+src/
+├── main.rs            # entry point: backend selection, viewport, run_native
+├── app.rs             # CursorOverlayApp: UI flow, region editing, settings
+├── config.rs          # constants + default region
+├── cursor.rs          # cursor bitmap: PNG loading + generated reticle
+├── input.rs           # raw low-level input (WH_MOUSE_LL hook + WM_INPUT):
+│                      #   mouse / pen (터치펜) / touch / trackpad, HID decode
+└── platform/
+    ├── mod.rs         # cfg dispatch (windows vs stub)
+    ├── windows.rs     # raw Win32: GetCursorPos/ShowCursor, HCURSOR,
+    │                  #   SetSystemCursor swap, WS_EX_TRANSPARENT,
+    │                  #   EnumWindows target tracking
+    └── stub.rs        # non-Windows no-ops
+```
