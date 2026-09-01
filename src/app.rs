@@ -20,6 +20,7 @@
 use crate::input::{self, InputEvent, InputSnapshot};
 use crate::platform;
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 /// A rectangle in logical (CSS) pixels, relative to the overlay window
 /// (origin = the overlay's top-left, which equals the target window's
@@ -40,6 +41,11 @@ impl RectF {
 
 /// Minimum region size (logical px) enforced by the frontend editor.
 pub const MIN_REGION: f32 = 24.0;
+
+/// How long the overlay stays in “pen mode” (click-through) after the last
+/// pen event, so the app below receives real Windows Ink / WM_POINTER
+/// strokes without us stealing them.
+const PEN_ACTIVE_MS: u64 = 1200;
 
 pub struct App {
     // --- settings (mirrored to / edited from the frontend) ---
@@ -67,13 +73,18 @@ pub struct App {
     win_origin: (f32, f32),
 
     // --- per-frame state ---
-    out_region_frames: u32,
+    /// When the pointer left the region (for the 60 ms out-of-region grace).
+    last_out_region: Option<Instant>,
     last_passthrough: Option<bool>,
     last_sent: Option<String>,
     /// Frontend UI rectangles (logical px, window-local): status bar,
     /// settings panel. Forwarded clicks inside them are swallowed so our UI
     /// doesn't double-fire into the app below.
     ui_rects: Vec<(f32, f32, f32, f32)>,
+    /// Last pen activity (raw HID `Pen` events).
+    last_pen_at: Option<Instant>,
+    /// Last pen activity reported by the frontend (PointerEvent type=pen).
+    frontend_pen_at: Option<Instant>,
 
     // --- raw input ---
     raw: InputSnapshot,
@@ -105,10 +116,12 @@ impl App {
             win_w: 0.0,
             win_h: 0.0,
             win_origin: (0.0, 0.0),
-            out_region_frames: 0,
+            last_out_region: None,
             last_passthrough: None,
             last_sent: None,
             ui_rects: Vec::new(),
+            last_pen_at: None,
+            frontend_pen_at: None,
             raw: InputSnapshot::default(),
             raw_rx: input::start(),
         }
@@ -156,6 +169,9 @@ impl App {
         // Drain raw input (mouse / pen / touch) into the snapshot.
         if let Some(rx) = &self.raw_rx {
             while let Ok(ev) = rx.try_recv() {
+                if matches!(ev, InputEvent::Pen { .. }) {
+                    self.last_pen_at = Some(Instant::now());
+                }
                 self.raw.apply(&ev);
             }
         }
@@ -167,28 +183,47 @@ impl App {
         let in_region = self.window_follow_active && self.region.contains(plx, ply);
 
         // Hysteresis: a pen can briefly glitch the reported position the
-        // instant it touches, so don't drop the owned cursor on a single
-        // out-of-region frame — only after a few consecutive ones.
+        // instant it touches, so don't drop the owned cursor on a momentary
+        // out-of-region sample — keep it for 60 ms after leaving.
         if in_region {
-            self.out_region_frames = 0;
+            self.last_out_region = None;
         } else {
-            self.out_region_frames = self.out_region_frames.saturating_add(1);
+            let _ = self.last_out_region.get_or_insert(Instant::now());
         }
-        let in_region_eff = self.out_region_frames < 3;
+        let in_region_eff = in_region
+            || self
+                .last_out_region
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(60));
+
+        // Pen in use? While the pen is active we must NOT own the input —
+        // the app below needs the real Windows Ink / WM_POINTER stroke. We
+        // go click-through instead (our forwarding only replays *mouse*
+        // messages, which Ink pens don't always synthesize). Decay keeps it
+        // stable across small gaps.
+        let now = Instant::now();
+        let pen_active = self
+            .last_pen_at
+            .is_some_and(|t| now.duration_since(t).as_millis() < PEN_ACTIVE_MS as u128)
+            || self
+                .frontend_pen_at
+                .is_some_and(|t| now.duration_since(t).as_millis() < PEN_ACTIVE_MS as u128);
 
         let overlay_on =
             self.enabled && !self.editing && !self.settings_open && self.window_follow_active;
-        let owning = overlay_on && in_region_eff;
+        let owning = overlay_on && in_region_eff && !pen_active;
 
         // Pass-through decision:
         //  * no target / disabled   -> click-through (invisible layer)
         //  * editing / settings     -> non-click-through (frontend needs input)
+        //  * pen in use             -> click-through (app below gets real pen)
         //  * overlay on, in region  -> non-click-through (we own the cursor)
         //  * overlay on, out region -> click-through (app below gets input)
         let passthrough = if !self.window_follow_active {
             true
         } else if self.editing || self.settings_open {
             false
+        } else if pen_active {
+            true
         } else {
             !owning
         };
@@ -233,7 +268,7 @@ impl App {
             self.last_sent = None;
         }
 
-        let state = self.state_json(owning, in_region_eff, passthrough);
+        let state = self.state_json(owning, in_region_eff, passthrough, pen_active);
         if self.last_sent.as_deref() != Some(state.as_str()) {
             self.last_sent = Some(state.clone());
             return Some(state);
@@ -321,6 +356,17 @@ impl App {
                 self.force_push = true;
             }
             "quit" => self.quit = true,
+            "pen_active" => {
+                let active = v
+                    .get("value")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                self.frontend_pen_at = if active {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+            }
             _ => {}
         }
     }
@@ -439,7 +485,7 @@ impl App {
         }
     }
 
-    fn state_json(&self, owning: bool, in_region: bool, passthrough: bool) -> String {
+    fn state_json(&self, owning: bool, in_region: bool, passthrough: bool, pen_active: bool) -> String {
         serde_json::json!({
             "enabled": self.enabled,
             "editing": self.editing,
@@ -448,6 +494,7 @@ impl App {
             "owning": owning,
             "passthrough": passthrough,
             "in_region": in_region,
+            "pen_active": pen_active,
             "found": self.window_follow_active,
             "target": self.target_window.clone().unwrap_or_default(),
             "device": self.raw.last_device,

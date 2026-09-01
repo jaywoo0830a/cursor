@@ -38,8 +38,13 @@ Chromium 창은 그렇지 않습니다. **영역 안에서는 이 창이 히트�
    포워딩됩니다. 고주파 상대 델타/펜/터치는 `WM_INPUT` raw input으로 별도 캡처.
 2. **판정 (Rust)** — 전역 포인터가 영역 안이면 `owning`(창이 커서 소유), 밖이면
    `passthrough`(클릭통과). 영역 경계에서 `WS_EX_TRANSPARENT`를 자동 토글.
+   **펜 활성 시에는 항상 `passthrough`** — 마우스 전용 포워딩은 Windows Ink
+   펜(WISP/WM_POINTER)을 재현할 수 없으므로, 펜이 쓰이는 동안은 창이 클릭통과가
+   되어 아래 앱이 진짜 펜 스트로크를 직접 받습니다. (프론트가 `pointerType==='pen'`
+   이벤트 또는 raw HID Pen 이벤트로 감지 → 1.2초 디케이)
 3. **렌더 (Chromium)** — `owning` 상태면 프론트가 CSS 커서 div를 그립니다.
-   (프론트는 네이티브 `pointermove`를 받으므로 IPC 지연 없이 커서 추적)
+   (프론트는 네이티브 `pointermove`를 받으므로 IPC 지연 없이 커서 추적 —
+   `transform`만 갱신해 레이아웃/페인트 없이 합성기에서 이동)
 4. **포워딩 (Rust)** — 오버레이가 입력을 가로챘으므로 `forward_mouse`가
    `PostMessageW`(ScreenToClient 좌표 + 버튼 다운 시 SetForegroundWindow)로
    아래 창에 재생성 메시지를 보내 정상 동작하게 합니다. 프론트 UI(상태바/패널)
@@ -92,3 +97,17 @@ index.html             Chromium 프론트 (CSS 커서, 영역 편집기, 설정 
   WebView2 런타임을 재사용해 설치/실행 오버헤드가 작습니다.
 - `windows-sys 0.59` (raw Win32), `serde_json` (IPC), `log`/`env_logger`.
 - 프론트는 CDN/외부 파일 없음 — `index.html` 하나가 바이너리에 내장됩니다.
+
+## 알려진 한계
+
+- 상태바 ⚙ / 설정 패널은 **영역 안에서만 클릭 가능**합니다 (영역 밖은 창이
+  클릭통과라 이벤트가 안 옴).
+- **펜 모드 동안에는 커스텀 커서가 숨겨집니다** — 펜이 쓰이는 동안은 클릭통과로
+  전환되어 아래 앱이 진짜 Windows Ink 스트로크를 받고, 아래 앱이 잉크/자체 커서를
+  그립니다 (커서보다 입력 우선).
+- 빠른 **단일 탭 한 번**은 펜이 우리 창에 잡혔다가 클릭통과로 전환되는 사이 유실될
+  수 있습니다 (연속 스트로크/필기는 정상).
+- `PostMessage` 포워딩이라 `GetCursorPos()`를 직접 읽는 일부 앱은 실제 OS 커서
+  위치와 어긋날 수 있습니다 (대부분은 메시지 좌표 `GetMessagePos`를 사용하므로
+  문제없음).
+

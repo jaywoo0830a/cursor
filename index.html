@@ -22,8 +22,7 @@
     position: fixed; left: 0; top: 0; z-index: 999999;
     width: 22px; height: 22px;
     pointer-events: none; display: none;
-    transform: translate(-50%, -50%);
-    will-change: left, top;
+    will-change: transform;   /* compositor-only moves: no layout/paint per event */
   }
   #cur .ring {
     position: absolute; inset: 0; border-radius: 50%;
@@ -77,7 +76,6 @@
     color: rgba(230,230,230,0.85);
     background: rgba(20,20,30,0.55);
     padding: 4px 8px; border-radius: 6px;
-    -webkit-backdrop-filter: blur(2px);
     pointer-events: auto;
   }
   #gear {
@@ -97,7 +95,6 @@
     border: 1px solid rgba(255,255,255,0.12);
     border-radius: 10px;
     padding: 12px 14px;
-    -webkit-backdrop-filter: blur(6px);
     box-shadow: 0 8px 30px rgba(0,0,0,0.5);
     display: none; pointer-events: auto;
   }
@@ -178,7 +175,7 @@
 let state = {
   enabled: true, editing: false, show_region: false, settings: false,
   owning: false, passthrough: true, in_region: false, found: false,
-  target: "", device: "mouse",
+  pen_active: false, target: "", device: "mouse",
   region: { x: 0, y: 0, w: 0, h: 0 },
   win: { w: 0, h: 0 },
 };
@@ -207,9 +204,30 @@ function onPointer(e) {
 window.addEventListener("pointermove", onPointer, { passive: true });
 window.addEventListener("mousemove", onPointer, { passive: true });
 
+// Pen detection: if a *pen* PointerEvent reaches us, we are stealing the
+// stroke from the app below (window owns hit-testing). Tell Rust so it can
+// switch to click-through and let the real Windows Ink / WM_POINTER stroke
+// reach the app. IPC is sent only on transitions (not per event).
+let penTimer = null;
+let penActiveSent = false;
+function penSeen() {
+  if (!penActiveSent) {
+    penActiveSent = true;
+    send({ cmd: "pen_active", value: true });
+  }
+  clearTimeout(penTimer);
+  penTimer = setTimeout(() => {
+    penActiveSent = false;
+    send({ cmd: "pen_active", value: false });
+  }, 1000);
+}
+window.addEventListener("pointermove", (e) => { if (e.pointerType === "pen") penSeen(); });
+window.addEventListener("pointerdown", (e) => { if (e.pointerType === "pen") penSeen(); });
+
 function positionCursor() {
-  cur.style.left = pointer.x + "px";
-  cur.style.top = pointer.y + "px";
+  // compositor-only: transform (not left/top) so moves don't trigger layout
+  cur.style.transform =
+    "translate3d(" + pointer.x + "px," + pointer.y + "px,0) translate(-50%,-50%)";
 }
 function renderCursor() {
   const show = state.owning || state.editing || state.settings;
@@ -288,6 +306,8 @@ function scheduleRegionSend(immediate) {
 }
 
 // ---- render ----
+let lastUiRectsJson = "";
+
 function renderRegion() {
   const show = state.show_region || state.editing;
   regionEl.style.display = show ? "block" : "none";
@@ -310,6 +330,7 @@ function renderStatus() {
   statusDetail.textContent =
     "owning=" + state.owning +
     " · passthrough=" + state.passthrough +
+    " · pen=" + state.pen_active +
     " · region=" + JSON.stringify(state.region) +
     " · win=" + state.win.w + "x" + state.win.h;
 }
@@ -333,7 +354,11 @@ function reportUiRects() {
       rects.push({ x: r.left, y: r.top, w: r.width, h: r.height });
     }
   });
-  send({ cmd: "set_ui_rects", rects });
+  const json = JSON.stringify(rects);
+  if (json !== lastUiRectsJson) {   // only push when actually changed
+    lastUiRectsJson = json;
+    send({ cmd: "set_ui_rects", rects });
+  }
 }
 
 function render() {
